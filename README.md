@@ -1,75 +1,95 @@
 # Vaultwarden & Bitwarden Maintenance Toolkit
 
-Ein robustes Bash- und `jq`-Werkzeug mit zwei vollwertigen Betriebsmodi:
-1. **Interaktiver Assistent (`-i` / `--interactive`):** Menügeführter Workflow mit Planungsvorschau, Detailanalyse und expliziter Bestätigung vor jedem Schreib-/Löschvorgang.
-2. **Direkte Kommandozeilenaufrufe:** Für Skripte, CI/CD-Pipelines oder schnelle Terminalabfragen.
+A robust Bash and `jq` toolkit with two operational modes:
+1. **Interactive Wizard (`-i` / `--interactive`):** Menu-guided workflow with pre-execution planning, detailed analysis, and explicit confirmation prompts before any write or delete actions.
+2. **Direct CLI Automation:** For headless operation, CI/CD pipelines, or quick queries.
 
 ---
 
-## 1. Interaktiver Modus (Assistent & Schritt-für-Schritt-Planung)
+## 1. Interactive Mode (Wizard & Step-by-Step Resolution)
 
-Starte den interaktiven Modus entweder direkt gegen eine exportierte JSON-Datei oder dein Vaultwarden-Setup:
+Launch the interactive wizard against an exported JSON file or directly with your Vaultwarden setup:
 
 ```bash
-# Offline gegen Test-Fixture oder unverschlüsselten JSON-Export
-./vault_manager.sh -i --file tests/fixture_duplicates.json
+# Offline simulation against mock Bitwarden environment
+./vault_manager.sh -i --mock-bw tests/mock_vault
+# (or simply: ./vault_manager.sh -i --mock-bw tests)
 
-# Gegen Live-Bitwarden CLI (Lokal)
-export BW_SESSION="deine_session"
+# Against an exported JSON file
+./vault_manager.sh -i --file tests/fixture_all.json
+
+# Against live Bitwarden CLI (local session)
+export BW_SESSION="your_session_key"
 ./vault_manager.sh -i
 
-# Gegen Docker-Container
+# Against Docker container
 ./vault_manager.sh -i --docker vaultwarden-cli
 ```
 
-### Der Ablauf im interaktiven Modus:
-1. **Hauptmenü:** Auswahl der Operation (KeePass-Fix, Namen generieren, Duplikat-Tiers 1-3, Merge & Bereinigung).
-2. **Analyse & Fortschrittsanzeige:** Der Tresor wird mit visualisiertem Fortschrittsbalken gescannt.
-3. **Planungsvorschau (Tabelle):** Es wird tabellarisch aufgeschlüsselt:
-   * Welche Einträge betroffen sind.
-   * Welche IDs kanonisch beibehalten werden.
-   * Welche Felder (Notizen, URIs, Custom Fields) verschmolzen werden.
-   * **Welche IDs zur Löschung vorgesehen sind.**
-   * Status von Passkeys (`LOCKED 🔒` oder `YES ⚠️`).
-4. **Explizite Bestätigungsabfrage:**
+### Interactive Workflow:
+1. **Main Menu:**
+   - `[1]` Fix KeePass URLs (migrate URLs from notes/fields into URI matches)
+   - `[2]` Fix missing / generic names (restore 'Domain (Username)')
+   - `[3]` Analyze & resolve duplicates (smart multi-tier audit & passkey-protected merge)
+   - `[q]` Quit
+2. **Smart Duplicate Analysis & Resolution (Option 3):**
+   - Automatically executes a multi-tier scan across:
+     - **Tier 1 (Exact):** Identical payload and timestamps.
+     - **Tier 2 (Content):** Identical payload, timestamps ignored.
+     - **Tier 3 (Partial):** Merge candidates with same domain and username.
+     - **Passkey Armor:** Audits and protects `fido2Credentials`.
+   - Displays a comprehensive audit report.
+   - Prompts for targeted actions based on findings:
+     - `[1]` Safe Merge & Cleanup (consolidate fields, delete redundant items)
+     - `[2]` View Tier 1 details
+     - `[3]` View Tier 2 details
+     - `[4] `View Tier 3 details
+     - `[5]` Preview complete merge & deletion plan table
+     - `[b]` Back to main menu
+3. **Explicit Confirmation Prompt:**
    ```text
-   Aktion erforderlich:
-     Soll die geplante Operation Löschung von 2 redundanten Duplikaten jetzt tatsächlich ausgeführt werden?
-     [j/N] (Standard: Nein, Abbrechen):
+   Action required:
+     Do you want to execute the planned operation Deletion of 4 redundant duplicate(s) now?
+     [y/N] (Default: No, Cancel):
    ```
-5. Erst nach Bestätigung mit `j` oder `y` wird die Löschung oder Aktualisierung tatsächlich ausgeführt.
+   Changes and deletions are only executed after explicit confirmation (`y`).
 
 ---
 
-## 2. Direkte CLI-Aufrufe (Automatisierungsmodus)
+## 2. Direct CLI Commands (Automation Mode)
 
 ```bash
-# 1. Duplikate auflisten (Tier 2: Content-Match)
+# 1. Full duplicate audit and interactive resolution
+./vault_manager.sh --file export.json duplicates
+
+# 2. Inspect duplicates by strictness tier
 ./vault_manager.sh --file export.json find-duplicates --tier content
 
-# 2. Merge-Planung anzeigen (Standard: Dry-Run Preview)
+# 3. Dry-run preview of merge plan
 ./vault_manager.sh --file export.json merge-duplicates
 
-# 3. KeePass-URIs migrieren und in neue Datei schreiben
+# 4. Migrate KeePass URIs and write to clean file
 ./vault_manager.sh --file export.json fix-uris --output clean_vault.json
 ```
 
 ---
 
-## 3. Duplikat-Stufen & Passkey-Sicherheitsgarantie
+## 3. Duplicate Tiers & Passkey Safety Armor
 
-* **Tier 1 (`exact`):** Vergleicht ausnahmslos alle Attribute via `jq`. Nur die `id` wird ignoriert. Abweichungen im `creationDate` oder `revisionDate` gelten strikt als Unterschied.
-* **Tier 2 (`content`):** Vergleicht die reinen Nutzdaten (Login, Passwort, URIs, Notizen, Felder) und ignoriert Server-Zeitstempel und IDs.
-* **Tier 3 (`partial`):** Erkennt Konten mit gleicher Domain und demselben User, die asymmetrische Zusatzfelder haben (Merge-Kandidaten).
-* **Passkey-Schutz (`fido2Credentials`):**
-  * Einträge mit Passkeys werden **immer als kanonisch fixiert**.
-  * Sie werden **niemals zur Löschung vorgeschlagen oder gelöscht**.
-  * Haben mehrere Einträge eigene Passkeys, wird der Löschvorgang mit `CONFLICT_MULTIPLE_PASSKEYS` abgebrochen.
+* **Tier 1 (`exact`):** Strict comparison of all attributes via `jq`. Only `id` is ignored. Differing `creationDate` or `revisionDate` values count as distinct items.
+* **Tier 2 (`content`):** Compares core payload (login, password, URIs, notes, custom fields) while ignoring server timestamps and IDs.
+* **Tier 3 (`partial`):** Identifies accounts with matching domain and username that hold divergent fields (merge candidates).
+* **Passkey Protection (`fido2Credentials`):**
+  * Items with passkeys are **always locked as canonical records**.
+  * They are **never proposed for deletion and never deleted**.
+  * If multiple entries hold separate passkeys, merge deletion is aborted with `CONFLICT_MULTIPLE_PASSKEYS`.
 
 ---
 
-## 4. Vollständige Offline-Tests ausführen
+## 4. Run Offline Test Suite
 
 ```bash
+./vault_manager.sh test-run
+# or
 ./tests/run_tests.sh
 ```

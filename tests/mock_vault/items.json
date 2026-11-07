@@ -1,5 +1,84 @@
 [
   {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "type": 1,
+    "name": "KeePass Imported Service",
+    "notes": "Legacy import notes.\nWeb URL: https://internal.company.net/login\nKeep safe.",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "SecretPassword123!",
+      "uris": []
+    },
+    "fields": [
+      {
+        "name": "LegacySSO",
+        "value": "https://auth.company.net/sso",
+        "type": 0
+      }
+    ]
+  },
+  {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "type": 1,
+    "name": "Already Clean Item",
+    "notes": "Already perfectly configured item.",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "PasswordXYZ",
+      "uris": [
+        {
+          "uri": "https://gitlab.com",
+          "match": 0
+        }
+      ]
+    },
+    "fields": []
+  },
+  {
+    "id": "33333333-3333-3333-3333-333333333333",
+    "type": 1,
+    "name": "https://login.microsoftonline.com",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "AzurePassword1!",
+      "uris": [
+        {
+          "uri": "https://login.microsoftonline.com/common/oauth2",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "44444444-4444-4444-4444-444444444444",
+    "type": 1,
+    "name": "",
+    "login": {
+      "username": "admin",
+      "password": "AdminPassword!",
+      "uris": [
+        {
+          "uri": "https://pve-cluster.lan:8006",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "55555555-5555-5555-5555-555555555555",
+    "type": 1,
+    "name": "Already Proper Name",
+    "login": {
+      "username": "bernhard",
+      "uris": [
+        {
+          "uri": "https://github.com",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
     "id": "aaaa1111-0000-0000-0000-000000000001",
     "type": 1,
     "name": "app.teamgantt.com",
