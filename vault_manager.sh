@@ -22,7 +22,8 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="2.3.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="2.4.0"
 
 # --- Configurations ---
 MODE="preview"            # "preview" (default dry-run) or "apply"
@@ -32,7 +33,14 @@ DOCKER_CONTAINER=""
 INPUT_FILE=""
 OUTPUT_FILE=""
 MOCK_BW_DIR=""
+LOCAL_BW_BIN="$SCRIPT_DIR/.bin/bw"
 BW_CMD="bw"
+SERVER_URL=""
+BOOTSTRAP_BW=false
+CONNECTED_ACCOUNT=""
+DETECTED_SERVER_HINT=""
+CAPTURED_STDOUT=""
+CAPTURED_STDERR=""
 
 # Terminal styling (protected against unset TERM / set -e failure)
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
@@ -120,6 +128,47 @@ render_progress() {
     fi
 }
 
+read_tty_line() {
+    local __var_name="$1"
+    local __line=""
+    if [[ -t 0 ]] && [[ -r /dev/tty ]]; then
+        IFS= read -r __line </dev/tty || __line=""
+    else
+        IFS= read -r __line || __line=""
+    fi
+    printf -v "$__var_name" '%s' "$__line"
+}
+
+read_tty_secret() {
+    local __var_name="$1"
+    local __secret=""
+    if [[ -t 0 ]] && [[ -r /dev/tty ]]; then
+        IFS= read -r -s __secret </dev/tty || __secret=""
+        printf "\n" >&2
+    else
+        IFS= read -r __secret || __secret=""
+    fi
+    printf -v "$__var_name" '%s' "$__secret"
+}
+
+prompt_yes_default() {
+    local question="$1"
+    printf "\n${BOLD}${YELLOW}Action required:${RESET}\n" >&2
+    printf "  %s\n" "$question" >&2
+    printf "  [Y/n] (Default: Yes): " >&2
+
+    local choice=""
+    read_tty_line choice
+    case "$choice" in
+        ""|[yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Interactive confirmation prompt
 prompt_confirmation() {
     local action_description="$1"
@@ -127,12 +176,8 @@ prompt_confirmation() {
     printf "  Do you want to execute the planned operation ${BOLD}%s${RESET} now?\n" "$action_description" >&2
     printf "  [y/N] (Default: No, Cancel): " >&2
     
-    local choice
-    if [[ -t 0 ]]; then
-        read -r choice </dev/tty || choice="n"
-    else
-        read -r choice || choice="n"
-    fi
+    local choice=""
+    read_tty_line choice
     case "$choice" in
         [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
             return 0
@@ -152,7 +197,7 @@ ${BOLD}Vaultwarden & Bitwarden Maintenance Engine v${VERSION}${RESET}
 Usage: $SCRIPT_NAME [OPTIONS] [COMMAND]
 
 ${BOLD}Interactive Mode:${RESET}
-  $SCRIPT_NAME -i               Start interactive wizard (guided menu, plan preview, confirmation)
+  $SCRIPT_NAME -i               Start interactive wizard (auto-bootstraps 'bw', login/unlock, plan & confirm)
 
 ${BOLD}Commands:${RESET}
   ${CYAN}fix-uris${RESET}             Extract URLs from notes/fields into login.uris (KeePass cleanup)
@@ -167,16 +212,21 @@ ${BOLD}Commands:${RESET}
 
 ${BOLD}Options:${RESET}
   -i, --interactive    Interactive wizard mode with step-by-step confirmation
+  --server <url>       Vaultwarden / Bitwarden server URL (e.g. https://vault.example.com)
+  --bootstrap-bw       Automatically download standalone 'bw' CLI into ./.bin/bw if missing
   --file <path>        Operate on a local JSON export file directly (no bw instance required)
   --mock-bw <dir>      Simulate a live Bitwarden CLI environment using a mock state directory
-  --docker <container> Run 'bw' commands inside specified Docker container (e.g. --docker vaultwarden-cli)
+  --docker <container> Run 'bw' inside a Bitwarden CLI container (not the vaultwarden/server container)
   --apply              Apply modifications directly (Default is DRY-RUN preview only)
   --output <path>      Save modified JSON to file (when using --file)
   --tier <name>        Duplicate detection tier: 'exact' (default), 'content', 'partial'
   -h, --help           Show this help message
 
 ${BOLD}Examples:${RESET}
-  # Interactive Wizard:
+  # Live Interactive Wizard against Vaultwarden (auto-installs ./.bin/bw if needed):
+  $SCRIPT_NAME -i --server https://vault.example.com
+
+  # Offline Interactive Wizard (simulation):
   $SCRIPT_NAME --interactive --mock-bw tests/mock_vault
 
   # Direct CLI preview:
@@ -192,13 +242,483 @@ check_dependencies() {
     fi
 }
 
-fetch_vault_json() {
+normalize_server_url() {
+    local url="${1:-}"
+    url="${url#"${url%%[![:space:]]*}"}"
+    url="${url%"${url##*[![:space:]]}"}"
+    if [[ -z "$url" || "$url" == "null" ]]; then
+        printf ''
+        return 0
+    fi
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        url="https://$url"
+    fi
+    url="${url%/}"
+    printf '%s' "$url"
+}
+
+detect_vaultwarden_domain_hint() {
+    if ! command -v docker >/dev/null 2>&1; then
+        return 0
+    fi
+    local cid domain=""
+    if [[ -n "$DOCKER_CONTAINER" ]]; then
+        domain="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DOCKER_CONTAINER" 2>/dev/null | sed -n 's/^DOMAIN=//p' | head -n 1 || true)"
+    fi
+    if [[ -z "$domain" ]]; then
+        while IFS= read -r cid; do
+            [[ -z "$cid" ]] && continue
+            domain="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null | sed -n 's/^DOMAIN=//p' | head -n 1 || true)"
+            [[ -n "$domain" ]] && break
+        done < <(docker ps --format '{{.ID}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /vaultwarden|bitwarden/ {print $1}' || true)
+    fi
+    if [[ -n "$domain" ]]; then
+        normalize_server_url "$domain"
+    fi
+}
+
+run_bw_exec() {
+    if [[ "$EXEC_TARGET" == "docker" ]]; then
+        local -a d_args=()
+        if [[ "${1:-}" == "--stdin" ]]; then
+            d_args+=(-i)
+            shift
+        elif [[ "${1:-}" == "--tty" ]]; then
+            d_args+=(-it)
+            shift
+        fi
+        [[ -n "${BW_SESSION:-}" ]] && d_args+=(-e BW_SESSION)
+        [[ -n "${BW_PASSWORD:-}" ]] && d_args+=(-e BW_PASSWORD)
+        [[ -n "${BW_CLIENTID:-}" ]] && d_args+=(-e BW_CLIENTID)
+        [[ -n "${BW_CLIENTSECRET:-}" ]] && d_args+=(-e BW_CLIENTSECRET)
+        [[ -n "${NODE_TLS_REJECT_UNAUTHORIZED:-}" ]] && d_args+=(-e NODE_TLS_REJECT_UNAUTHORIZED)
+        [[ -n "${NODE_EXTRA_CA_CERTS:-}" ]] && d_args+=(-e NODE_EXTRA_CA_CERTS)
+
+        BW_SESSION="${BW_SESSION:-}" \
+        BW_PASSWORD="${BW_PASSWORD:-}" \
+        BW_CLIENTID="${BW_CLIENTID:-}" \
+        BW_CLIENTSECRET="${BW_CLIENTSECRET:-}" \
+        docker exec ${d_args[@]+"${d_args[@]}"} "$DOCKER_CONTAINER" bw "$@"
+    else
+        if [[ "${1:-}" == "--stdin" || "${1:-}" == "--tty" ]]; then
+            shift
+        fi
+        "$BW_CMD" "$@"
+    fi
+}
+
+run_bw_capture() {
+    CAPTURED_STDOUT=""
+    CAPTURED_STDERR=""
+    local out_file err_file rc=0
+    out_file="$(mktemp)"
+    err_file="$(mktemp)"
+    run_bw_exec "$@" </dev/null >"$out_file" 2>"$err_file" || rc=$?
+    CAPTURED_STDOUT="$(cat "$out_file")"
+    CAPTURED_STDERR="$(cat "$err_file")"
+    rm -f "$out_file" "$err_file"
+    return "$rc"
+}
+
+run_bw_stdin() {
+    local stdin_payload="$1"
+    shift
+    CAPTURED_STDOUT=""
+    CAPTURED_STDERR=""
+    local out_file err_file rc=0
+    out_file="$(mktemp)"
+    err_file="$(mktemp)"
+    printf '%s' "$stdin_payload" | run_bw_exec --stdin "$@" >"$out_file" 2>"$err_file" || rc=$?
+    CAPTURED_STDOUT="$(cat "$out_file")"
+    CAPTURED_STDERR="$(cat "$err_file")"
+    rm -f "$out_file" "$err_file"
+    return "$rc"
+}
+
+print_bw_error_details() {
+    local combined="${CAPTURED_STDERR}${CAPTURED_STDOUT:+
+$CAPTURED_STDOUT}"
+    [[ -n "$CAPTURED_STDERR" ]] && printf "  %s\n" "$CAPTURED_STDERR" >&2
+    if [[ -n "$CAPTURED_STDOUT" && "$CAPTURED_STDOUT" != "$CAPTURED_STDERR" ]]; then
+        printf "  %s\n" "$CAPTURED_STDOUT" >&2
+    fi
+    if [[ "$combined" =~ SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT ]]; then
+        log_warn "TLS certificate error detected. For self-signed certs, set NODE_EXTRA_CA_CERTS=/path/to/ca.pem (or NODE_TLS_REJECT_UNAUTHORIZED=0 on trusted networks)."
+    fi
+}
+
+bootstrap_bw_cli() {
+    local os_name arch_name platform
+    os_name="$(uname -s 2>/dev/null || echo "Linux")"
+    arch_name="$(uname -m 2>/dev/null || echo "x86_64")"
+
+    case "$os_name" in
+        Linux*)  platform="linux" ;;
+        Darwin*) platform="macos" ;;
+        *)
+            log_error "Unsupported OS for automatic 'bw' bootstrap: $os_name. Please install Bitwarden CLI manually."
+            return 1
+            ;;
+    esac
+
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        log_error "Neither 'curl' nor 'wget' is installed. Cannot download Bitwarden CLI."
+        return 1
+    fi
+
+    local base_redirect_url="https://vault.bitwarden.com/download/?app=cli&platform=${platform}"
+    local dl_url="$base_redirect_url"
+
+    if [[ "$arch_name" == "aarch64" || "$arch_name" == "arm64" ]]; then
+        local resolved_loc=""
+        if command -v curl >/dev/null 2>&1; then
+            resolved_loc="$(curl -fsSI "$base_redirect_url" 2>/dev/null | awk 'tolower($1) == "location:" {sub(/\r$/, "", $2); print $2; exit}' || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            resolved_loc="$(wget --spider -S --max-redirect=0 "$base_redirect_url" 2>&1 | awk 'tolower($1) == "location:" {sub(/\r$/, "", $2); print $2; exit}' || true)"
+        fi
+        if [[ -n "$resolved_loc" ]]; then
+            dl_url="${resolved_loc/bw-${platform}-/bw-${platform}-arm64-}"
+        else
+            log_warn "Could not resolve ARM64 redirect header; attempting standard download URL."
+        fi
+    fi
+
+    local bin_dir
+    bin_dir="$(dirname "$LOCAL_BW_BIN")"
+    mkdir -p "$bin_dir"
+
+    local tmp_zip
+    tmp_zip="$(mktemp "${TMPDIR:-/tmp}/bw-cli-XXXXXX.zip")"
+
+    log_info "Downloading standalone Bitwarden CLI ($os_name / $arch_name)..."
+    local dl_rc=0
+    if command -v curl >/dev/null 2>&1; then
+        if [[ -t 2 ]]; then
+            curl -fL --progress-bar "$dl_url" -o "$tmp_zip" || dl_rc=$?
+        else
+            curl -fsSL "$dl_url" -o "$tmp_zip" || dl_rc=$?
+        fi
+    else
+        wget -q --show-progress -O "$tmp_zip" "$dl_url" 2>/dev/null || wget -q -O "$tmp_zip" "$dl_url" || dl_rc=$?
+    fi
+
+    if [[ $dl_rc -ne 0 || ! -s "$tmp_zip" ]]; then
+        rm -f "$tmp_zip"
+        log_error "Failed to download Bitwarden CLI from: $dl_url"
+        return 1
+    fi
+
+    log_info "Extracting Bitwarden CLI into $LOCAL_BW_BIN..."
+    local ext_rc=0
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$tmp_zip" -d "$bin_dir" || ext_rc=$?
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -m zipfile -e "$tmp_zip" "$bin_dir" || ext_rc=$?
+    elif command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xf "$tmp_zip" -C "$bin_dir" || ext_rc=$?
+    else
+        rm -f "$tmp_zip"
+        log_error "Cannot extract archive: please install 'unzip' or 'python3' (e.g. apt-get install -y unzip)."
+        return 1
+    fi
+    rm -f "$tmp_zip"
+
+    if [[ $ext_rc -ne 0 || ! -f "$LOCAL_BW_BIN" ]]; then
+        log_error "Extraction failed: '$LOCAL_BW_BIN' was not found after unpacking."
+        return 1
+    fi
+
+    chmod +x "$LOCAL_BW_BIN"
+    local bw_ver=""
+    if ! bw_ver="$("$LOCAL_BW_BIN" --version 2>/dev/null)"; then
+        log_error "Downloaded '$LOCAL_BW_BIN' failed verification ('bw --version')."
+        return 1
+    fi
+
+    BW_CMD="$LOCAL_BW_BIN"
+    log_success "Bitwarden CLI v${bw_ver} installed at $LOCAL_BW_BIN"
+    return 0
+}
+
+ensure_bw_cli() {
+    if command -v bw >/dev/null 2>&1; then
+        BW_CMD="$(command -v bw)"
+        return 0
+    fi
+    if [[ -x "$LOCAL_BW_BIN" ]]; then
+        BW_CMD="$LOCAL_BW_BIN"
+        log_info "Using local Bitwarden CLI: $LOCAL_BW_BIN"
+        return 0
+    fi
+
+    log_warn "Bitwarden CLI ('bw') was not found in PATH or $LOCAL_BW_BIN."
+    if [[ "$BOOTSTRAP_BW" == true ]]; then
+        bootstrap_bw_cli || exit 1
+        return 0
+    elif [[ "$INTERACTIVE" == true ]]; then
+        if prompt_yes_default "Download official standalone Bitwarden CLI into $LOCAL_BW_BIN now?"; then
+            bootstrap_bw_cli || exit 1
+            return 0
+        fi
+        log_error "Bitwarden CLI is required to connect to a live vault."
+        exit 1
+    else
+        log_error "Bitwarden CLI 'bw' not found. Run with '-i' or '--bootstrap-bw' to auto-install into ./.bin/bw, or use --file <path>."
+        exit 1
+    fi
+}
+
+ensure_bw_authenticated() {
+    while true; do
+        local st_rc=0
+        run_bw_capture status --nointeraction || st_rc=$?
+        if [[ $st_rc -ne 0 ]] && ! printf '%s' "$CAPTURED_STDOUT" | jq -e '.status' >/dev/null 2>&1; then
+            log_error "Failed to query Bitwarden CLI status:"
+            print_bw_error_details
+            exit 1
+        fi
+
+        local status current_server current_email norm_current
+        status="$(printf '%s' "$CAPTURED_STDOUT" | jq -r '.status // "unauthenticated"' 2>/dev/null || echo "unauthenticated")"
+        current_server="$(printf '%s' "$CAPTURED_STDOUT" | jq -r '.serverUrl // empty' 2>/dev/null || true)"
+        current_email="$(printf '%s' "$CAPTURED_STDOUT" | jq -r '.userEmail // empty' 2>/dev/null || true)"
+        norm_current="$(normalize_server_url "$current_server")"
+
+        if [[ -n "$SERVER_URL" ]]; then
+            local norm_target
+            norm_target="$(normalize_server_url "$SERVER_URL")"
+            if [[ "$status" != "unauthenticated" && -n "$norm_current" && "$norm_current" != "$norm_target" ]]; then
+                if [[ "$INTERACTIVE" == true ]]; then
+                    if prompt_yes_default "Bitwarden CLI is currently logged into '$current_server'. Logout and switch to '$norm_target'?"; then
+                        run_bw_capture logout --nointeraction || true
+                        BW_SESSION=""
+                        export BW_SESSION
+                        continue
+                    else
+                        exit 1
+                    fi
+                else
+                    log_error "Bitwarden CLI is logged into '$current_server', not '$norm_target'. Run 'bw logout' first or use '-i'."
+                    exit 1
+                fi
+            elif [[ "$status" == "unauthenticated" && "$norm_current" != "$norm_target" ]]; then
+                if ! run_bw_capture config server "$norm_target" --nointeraction; then
+                    log_error "Failed to configure server URL '$norm_target':"
+                    print_bw_error_details
+                    exit 1
+                fi
+                current_server="$norm_target"
+                norm_current="$norm_target"
+            fi
+        fi
+
+        if [[ "$status" == "unlocked" ]]; then
+            CONNECTED_ACCOUNT="${current_email:-authenticated} @ ${current_server:-default}"
+            break
+        fi
+
+        if [[ "$status" == "unauthenticated" ]]; then
+            if [[ "$INTERACTIVE" != true ]]; then
+                log_error "Bitwarden CLI is not logged in (status: unauthenticated)."
+                log_info "Run './$SCRIPT_NAME -i' for interactive setup, or authenticate via 'bw config server <url> && bw login'."
+                exit 1
+            fi
+
+            log_header "BITWARDEN / VAULTWARDEN CLI AUTHENTICATION"
+
+            if [[ -z "$SERVER_URL" ]]; then
+                local default_srv="$DETECTED_SERVER_HINT"
+                if [[ -z "$default_srv" ]]; then
+                    default_srv="$(detect_vaultwarden_domain_hint)"
+                fi
+                if [[ -z "$default_srv" && -n "$norm_current" ]]; then
+                    default_srv="$norm_current"
+                fi
+
+                if [[ -n "$default_srv" ]]; then
+                    printf "  Vaultwarden Server URL [${CYAN}%s${RESET}]: " "$default_srv" >&2
+                else
+                    printf "  Vaultwarden Server URL (e.g. https://vault.example.com): " >&2
+                fi
+                local input_srv=""
+                read_tty_line input_srv
+                input_srv="${input_srv:-$default_srv}"
+                input_srv="$(normalize_server_url "$input_srv")"
+
+                if [[ -z "$input_srv" ]]; then
+                    log_error "A valid Vaultwarden / Bitwarden Server URL is required."
+                    continue
+                fi
+
+                if ! run_bw_capture config server "$input_srv" --nointeraction; then
+                    log_error "Failed to configure server '$input_srv':"
+                    print_bw_error_details
+                    continue
+                fi
+                SERVER_URL="$input_srv"
+                log_success "Configured server: $input_srv"
+            fi
+
+            printf "\n  ${BOLD}Login Method:${RESET}\n" >&2
+            printf "    [1] Email & Master Password (supports 2FA) [Default]\n" >&2
+            printf "    [2] Personal API Key (client_id & client_secret)\n" >&2
+            printf "    [u] Change Server URL\n" >&2
+            printf "    [q] Quit\n" >&2
+            printf "  Selection [1-2, u, q]: " >&2
+
+            local auth_method=""
+            read_tty_line auth_method
+            auth_method="${auth_method:-1}"
+
+            case "$auth_method" in
+                1)
+                    printf "  Email address: " >&2
+                    local bw_email=""
+                    read_tty_line bw_email
+                    if [[ -z "$bw_email" ]]; then
+                        log_error "Email address cannot be empty."
+                        continue
+                    fi
+
+                    printf "  Master Password: " >&2
+                    local bw_pw=""
+                    read_tty_secret bw_pw
+                    if [[ -z "$bw_pw" ]]; then
+                        log_error "Master Password cannot be empty."
+                        continue
+                    fi
+
+                    if BW_PASSWORD="$bw_pw" run_bw_capture login "$bw_email" --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
+                        BW_SESSION="$CAPTURED_STDOUT"
+                        export BW_SESSION
+                        unset bw_pw
+                        log_success "Logged in and unlocked vault."
+                        continue
+                    fi
+
+                    local combined_err="${CAPTURED_STDERR} ${CAPTURED_STDOUT}"
+                    if [[ "$combined_err" =~ [Tt]wo-[Ss]tep|2FA|[Tt]wo[Ff]actor|two[[:space:]]factor|verification[[:space:]]code|totp|[Mm]ethod ]] && [[ -r /dev/tty ]]; then
+                        log_info "Two-step login (2FA) detected — switching to interactive 2FA prompt..."
+                        local interactive_rc=0
+                        BW_PASSWORD="$bw_pw" run_bw_exec --tty login "$bw_email" --passwordenv BW_PASSWORD </dev/tty >/dev/tty 2>/dev/tty || interactive_rc=$?
+                        if [[ $interactive_rc -eq 0 ]]; then
+                            if BW_PASSWORD="$bw_pw" run_bw_capture unlock --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
+                                BW_SESSION="$CAPTURED_STDOUT"
+                                export BW_SESSION
+                            fi
+                            unset bw_pw
+                            continue
+                        fi
+                        unset bw_pw
+                        log_error "Interactive two-step login did not complete."
+                        continue
+                    fi
+
+                    unset bw_pw
+                    log_error "Login failed:"
+                    print_bw_error_details
+                    ;;
+                2)
+                    printf "  Client ID (e.g. user.xxxx...): " >&2
+                    local bw_cid=""
+                    read_tty_line bw_cid
+                    printf "  Client Secret: " >&2
+                    local bw_csecret=""
+                    read_tty_secret bw_csecret
+
+                    if [[ -z "$bw_cid" || -z "$bw_csecret" ]]; then
+                        unset bw_cid bw_csecret
+                        log_error "Both Client ID and Client Secret are required."
+                        continue
+                    fi
+
+                    if BW_CLIENTID="$bw_cid" BW_CLIENTSECRET="$bw_csecret" run_bw_capture login --apikey --nointeraction; then
+                        unset bw_cid bw_csecret
+                        log_success "API key authenticated. Proceeding to unlock vault..."
+                    else
+                        unset bw_cid bw_csecret
+                        log_error "API key login failed:"
+                        print_bw_error_details
+                    fi
+                    ;;
+                u|U)
+                    SERVER_URL=""
+                    ;;
+                q|Q)
+                    log_info "Cancelled authentication."
+                    exit 0
+                    ;;
+                *)
+                    log_error "Invalid selection: $auth_method"
+                    ;;
+            esac
+            continue
+        fi
+
+        if [[ "$status" == "locked" ]]; then
+            if [[ "$INTERACTIVE" != true ]]; then
+                log_error "Vault is locked (${current_email:-account} @ ${current_server:-server})."
+                log_info "Run with '-i' to unlock interactively, or run: export BW_SESSION=\"\$(bw unlock --raw)\""
+                exit 1
+            fi
+
+            log_info "Vault is locked for ${BOLD}${current_email:-account}${RESET} (${DIM}${current_server:-server}${RESET})"
+            printf "  Master Password (press Enter for account/server options): " >&2
+            local bw_pw=""
+            read_tty_secret bw_pw
+
+            if [[ -z "$bw_pw" ]]; then
+                printf "  Options: [u] Unlock  [l] Logout / Switch account or server  [q] Quit: " >&2
+                local lock_opt=""
+                read_tty_line lock_opt
+                case "$lock_opt" in
+                    l|L)
+                        run_bw_capture logout --nointeraction || true
+                        BW_SESSION=""
+                        export BW_SESSION
+                        SERVER_URL=""
+                        log_info "Logged out of previous session."
+                        ;;
+                    q|Q)
+                        exit 0
+                        ;;
+                esac
+                continue
+            fi
+
+            if BW_PASSWORD="$bw_pw" run_bw_capture unlock --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
+                BW_SESSION="$CAPTURED_STDOUT"
+                export BW_SESSION
+                unset bw_pw
+                log_success "Vault unlocked."
+            else
+                unset bw_pw
+                log_error "Unlock failed:"
+                print_bw_error_details
+            fi
+            continue
+        fi
+
+        log_error "Unrecognized Bitwarden CLI status: '$status'"
+        exit 1
+    done
+
+    log_info "Synchronizing vault with server..."
+    if ! run_bw_capture sync --nointeraction; then
+        log_error "Failed to synchronize vault:"
+        print_bw_error_details
+        exit 1
+    fi
+    log_success "Vault synchronized (${CONNECTED_ACCOUNT})."
+}
+
+prepare_target_environment() {
     if [[ "$EXEC_TARGET" == "file" ]]; then
         if [[ ! -f "$INPUT_FILE" ]]; then
             log_error "File not found: $INPUT_FILE"
             exit 1
         fi
-        cat "$INPUT_FILE"
+        return 0
     elif [[ "$EXEC_TARGET" == "mock" ]]; then
         if [[ ! -f "$MOCK_BW_DIR/items.json" ]]; then
             if [[ -f "$MOCK_BW_DIR/mock_vault/items.json" ]]; then
@@ -208,22 +728,104 @@ fetch_vault_json() {
                 exit 1
             fi
         fi
-        cat "$MOCK_BW_DIR/items.json"
+        return 0
     elif [[ "$EXEC_TARGET" == "docker" ]]; then
-        docker exec -i "$DOCKER_CONTAINER" bw list items
-    else
-        if ! command -v bw >/dev/null 2>&1; then
-            log_error "Bitwarden CLI 'bw' not found in PATH. Use --file <path> or --mock-bw <dir> to test offline."
+        if ! command -v docker >/dev/null 2>&1; then
+            log_error "'docker' command not found on host."
             exit 1
         fi
-        bw list items
+        local is_running=""
+        is_running="$(docker inspect -f '{{.State.Running}}' "$DOCKER_CONTAINER" 2>/dev/null || true)"
+        if [[ "$is_running" != "true" ]]; then
+            log_error "Docker container '$DOCKER_CONTAINER' is not running or does not exist."
+            exit 1
+        fi
+        if ! docker exec "$DOCKER_CONTAINER" sh -c 'command -v bw >/dev/null 2>&1' </dev/null 2>/dev/null; then
+            local c_image=""
+            c_image="$(docker inspect -f '{{.Config.Image}}' "$DOCKER_CONTAINER" 2>/dev/null || echo "unknown")"
+            DETECTED_SERVER_HINT="$(detect_vaultwarden_domain_hint)"
+            log_warn "Container '$DOCKER_CONTAINER' (image: $c_image) does not contain the Bitwarden CLI ('bw')."
+            log_info "Note: 'vaultwarden/server' containers store encrypted ciphertext only and cannot decrypt items directly."
+            if [[ "$INTERACTIVE" == true ]]; then
+                if prompt_yes_default "Switch to local standalone Bitwarden CLI ($LOCAL_BW_BIN) instead?"; then
+                    EXEC_TARGET="local"
+                else
+                    exit 1
+                fi
+            else
+                log_error "Omit '--docker $DOCKER_CONTAINER' and run './$SCRIPT_NAME -i' to use the local standalone Bitwarden CLI."
+                exit 1
+            fi
+        fi
+    fi
+
+    if [[ "$EXEC_TARGET" == "local" ]]; then
+        ensure_bw_cli
+    fi
+
+    if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
+        ensure_bw_authenticated
     fi
 }
 
+fetch_vault_json() {
+    if [[ "$EXEC_TARGET" == "file" ]]; then
+        if [[ ! -f "$INPUT_FILE" ]]; then
+            log_error "File not found: $INPUT_FILE"
+            return 1
+        fi
+        cat "$INPUT_FILE"
+    elif [[ "$EXEC_TARGET" == "mock" ]]; then
+        if [[ ! -f "$MOCK_BW_DIR/items.json" ]]; then
+            if [[ -f "$MOCK_BW_DIR/mock_vault/items.json" ]]; then
+                MOCK_BW_DIR="$MOCK_BW_DIR/mock_vault"
+            else
+                log_error "Mock vault state not found at: $MOCK_BW_DIR/items.json"
+                return 1
+            fi
+        fi
+        cat "$MOCK_BW_DIR/items.json"
+    elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
+        if ! run_bw_capture list items --nointeraction; then
+            log_error "Failed to retrieve vault items from Bitwarden CLI:"
+            print_bw_error_details
+            return 1
+        fi
+        if ! printf '%s\n' "$CAPTURED_STDOUT" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            log_error "Bitwarden CLI returned unexpected non-JSON-array output:"
+            print_bw_error_details
+            return 1
+        fi
+        printf '%s\n' "$CAPTURED_STDOUT"
+    fi
+}
+
+bw_update_item() {
+    local item_json="$1"
+    local item_id
+    item_id="$(printf '%s\n' "$item_json" | jq -r '.id')"
+
+    if ! run_bw_stdin "$item_json" encode; then
+        log_error "Failed to encode item '$item_id':"
+        print_bw_error_details
+        return 1
+    fi
+    local encoded_item="$CAPTURED_STDOUT"
+
+    if ! run_bw_stdin "$encoded_item" edit item "$item_id" --nointeraction; then
+        log_error "Failed to update item '$item_id':"
+        print_bw_error_details
+        return 1
+    fi
+    return 0
+}
+
 apply_deletions() {
-    local ids_to_delete=($1)
+    local ids_to_delete=("$@")
     local total="${#ids_to_delete[@]}"
-    local current=0
+    local current=0 deleted_ok=0 deleted_fail=0
+
+    [[ "$total" -eq 0 ]] && return 0
 
     printf "\n" >&2
     log_info "Applying deletions for $total items..."
@@ -234,12 +836,23 @@ apply_deletions() {
         if [[ "$EXEC_TARGET" == "mock" ]]; then
             jq --arg item_id "$id" 'map(select(.id != $item_id))' "$MOCK_BW_DIR/items.json" > "$MOCK_BW_DIR/items.json.tmp"
             mv "$MOCK_BW_DIR/items.json.tmp" "$MOCK_BW_DIR/items.json"
-        elif [[ "$EXEC_TARGET" == "docker" ]]; then
-            docker exec "$DOCKER_CONTAINER" bw delete item "$id" >/dev/null 2>&1 || true
-        elif [[ "$EXEC_TARGET" == "local" ]]; then
-            bw delete item "$id" >/dev/null 2>&1 || true
+            deleted_ok=$((deleted_ok + 1))
+        elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
+            if run_bw_capture delete item "$id" --nointeraction; then
+                deleted_ok=$((deleted_ok + 1))
+            else
+                deleted_fail=$((deleted_fail + 1))
+                log_error "Failed to delete item '$id':"
+                print_bw_error_details
+            fi
         fi
     done
+
+    if [[ $deleted_fail -gt 0 ]]; then
+        log_warn "Deleted $deleted_ok item(s); $deleted_fail deletion(s) failed."
+        return 1
+    fi
+    return 0
 }
 
 # --- OPERATION 1: Fix URIs (KeePass Cleanup) ---
@@ -300,15 +913,16 @@ op_fix_uris() {
     fi
 
     # Interactive confirmation step
+    local effective_mode="$MODE"
     if [[ "$INTERACTIVE" == true ]]; then
         if prompt_confirmation "Update $modified_count item(s)"; then
-            MODE="apply"
+            effective_mode="apply"
         else
             return 0
         fi
     fi
 
-    if [[ "$MODE" == "preview" ]]; then
+    if [[ "$effective_mode" == "preview" ]]; then
         printf "\n" >&2
         log_warn "[DRY-RUN] No changes written. Run with -i or --apply to execute."
     elif [[ "$EXEC_TARGET" == "mock" ]]; then
@@ -321,22 +935,23 @@ op_fix_uris() {
         log_info "Sending updates to Bitwarden CLI..."
         local items_to_update
         items_to_update=$(echo "$transformed_json" | jq -c '.[] | select(._modified == true) | del(._modified, ._added_uris)')
-        local curr=0
-        while IFS= read -r item_json; do
+        local curr=0 ok_count=0 fail_count_upd=0 item_json
+        while IFS= read -r -u 3 item_json; do
             [[ -z "$item_json" ]] && continue
             curr=$((curr + 1))
             render_progress "$curr" "$modified_count" "Updating items"
-            local item_id
-            item_id=$(echo "$item_json" | jq -r '.id')
-            local encoded_item
-            encoded_item=$(echo "$item_json" | bw encode)
-            if [[ "$EXEC_TARGET" == "docker" ]]; then
-                docker exec -i "$DOCKER_CONTAINER" bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+            if bw_update_item "$item_json"; then
+                ok_count=$((ok_count + 1))
             else
-                bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+                fail_count_upd=$((fail_count_upd + 1))
             fi
-        done <<< "$items_to_update"
-        log_success "$modified_count item(s) successfully updated."
+        done 3<<< "$items_to_update"
+        if [[ $fail_count_upd -eq 0 ]]; then
+            log_success "$ok_count item(s) successfully updated."
+        else
+            log_warn "$ok_count item(s) updated, $fail_count_upd failed."
+            return 1
+        fi
     fi
 }
 
@@ -412,15 +1027,16 @@ op_fix_names() {
         return 0
     fi
 
+    local effective_mode="$MODE"
     if [[ "$INTERACTIVE" == true ]]; then
         if prompt_confirmation "Rename $modified_count item(s)"; then
-            MODE="apply"
+            effective_mode="apply"
         else
             return 0
         fi
     fi
 
-    if [[ "$MODE" == "preview" ]]; then
+    if [[ "$effective_mode" == "preview" ]]; then
         printf "\n" >&2
         log_warn "[DRY-RUN] No names modified. Run with -i or --apply to execute."
     elif [[ "$EXEC_TARGET" == "mock" ]]; then
@@ -433,22 +1049,23 @@ op_fix_names() {
         log_info "Sending name changes to Bitwarden CLI..."
         local items_to_update
         items_to_update=$(echo "$transformed_json" | jq -c '.[] | select(._modified == true) | del(._modified, ._old_name)')
-        local curr=0
-        while IFS= read -r item_json; do
+        local curr=0 ok_count=0 fail_count_upd=0 item_json
+        while IFS= read -r -u 3 item_json; do
             [[ -z "$item_json" ]] && continue
             curr=$((curr + 1))
             render_progress "$curr" "$modified_count" "Updating items"
-            local item_id
-            item_id=$(echo "$item_json" | jq -r '.id')
-            local encoded_item
-            encoded_item=$(echo "$item_json" | bw encode)
-            if [[ "$EXEC_TARGET" == "docker" ]]; then
-                docker exec -i "$DOCKER_CONTAINER" bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+            if bw_update_item "$item_json"; then
+                ok_count=$((ok_count + 1))
             else
-                bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+                fail_count_upd=$((fail_count_upd + 1))
             fi
-        done <<< "$items_to_update"
-        log_success "$modified_count item(s) successfully updated."
+        done 3<<< "$items_to_update"
+        if [[ $fail_count_upd -eq 0 ]]; then
+            log_success "$ok_count item(s) successfully updated."
+        else
+            log_warn "$ok_count item(s) updated, $fail_count_upd failed."
+            return 1
+        fi
     fi
 }
 
@@ -663,21 +1280,19 @@ execute_merge_plan() {
         return 0
     fi
 
+    local effective_mode="$MODE"
     if [[ "$INTERACTIVE" == true ]]; then
         if prompt_confirmation "Deletion of $total_deletions redundant duplicate(s)"; then
-            MODE="apply"
+            effective_mode="apply"
         else
             return 0
         fi
     fi
 
-    if [[ "$MODE" == "preview" ]]; then
+    if [[ "$effective_mode" == "preview" ]]; then
         printf "\n" >&2
         log_warn "[DRY-RUN] No items deleted. Run with -i or --apply to execute."
-    elif [[ "$MODE" == "apply" ]]; then
-        local ids_to_delete
-        ids_to_delete=$(echo "$merge_result" | jq -r '.[].redundant_ids_to_delete[]?')
-
+    elif [[ "$effective_mode" == "apply" ]]; then
         if [[ "$EXEC_TARGET" == "mock" ]]; then
             local merged_json
             merged_json=$(jq --argjson mr "$merge_result" '
@@ -695,6 +1310,7 @@ execute_merge_plan() {
               )
             ' "$MOCK_BW_DIR/items.json")
             echo "$merged_json" > "$MOCK_BW_DIR/items.json"
+            log_success "Cleanup completed: $total_deletions duplicate(s) successfully removed."
         elif [[ -n "$OUTPUT_FILE" ]]; then
             local merged_json
             merged_json=$(echo "$raw_json" | jq --argjson mr "$merge_result" '
@@ -713,24 +1329,41 @@ execute_merge_plan() {
             ')
             echo "$merged_json" > "$OUTPUT_FILE"
             log_success "Cleaned vault data saved to: $OUTPUT_FILE"
+            log_success "Cleanup completed: $total_deletions duplicate(s) successfully removed."
         elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
-            local items_to_update
-            items_to_update=$(echo "$merge_result" | jq -c '.[] | select(.status == "MERGED") | .merged_item')
-            while IFS= read -r item_json; do
-                [[ -z "$item_json" ]] && continue
-                local item_id
-                item_id=$(echo "$item_json" | jq -r '.id')
-                local encoded_item
-                encoded_item=$(echo "$item_json" | bw encode)
-                if [[ "$EXEC_TARGET" == "docker" ]]; then
-                    docker exec -i "$DOCKER_CONTAINER" bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+            local merge_entries total_clusters curr_cluster=0 entry_json
+            merge_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "MERGED")')
+            total_clusters=$(echo "$merge_result" | jq '[.[] | select(.status == "MERGED")] | length')
+            local -a safe_delete_ids=()
+
+            while IFS= read -r -u 3 entry_json; do
+                [[ -z "$entry_json" ]] && continue
+                curr_cluster=$((curr_cluster + 1))
+                render_progress "$curr_cluster" "$total_clusters" "Updating canonical items"
+                local merged_item_json
+                merged_item_json=$(printf '%s\n' "$entry_json" | jq -c '.merged_item')
+                if bw_update_item "$merged_item_json"; then
+                    local del_id
+                    while IFS= read -r del_id; do
+                        [[ -n "$del_id" ]] && safe_delete_ids+=("$del_id")
+                    done < <(printf '%s\n' "$entry_json" | jq -r '.redundant_ids_to_delete[]?')
                 else
-                    bw edit item "$item_id" "$encoded_item" >/dev/null 2>&1 || true
+                    local cname
+                    cname=$(printf '%s\n' "$entry_json" | jq -r '.name // .canonical_id')
+                    log_warn "Skipping deletion of duplicates for '$cname' because canonical update failed."
                 fi
-            done <<< "$items_to_update"
-            apply_deletions "$ids_to_delete"
+            done 3<<< "$merge_entries"
+
+            if [[ "${#safe_delete_ids[@]}" -eq 0 ]]; then
+                log_warn "No redundant items were deleted due to canonical update failures."
+                return 1
+            fi
+            if apply_deletions ${safe_delete_ids[@]+"${safe_delete_ids[@]}"}; then
+                log_success "Cleanup completed: ${#safe_delete_ids[@]} duplicate(s) successfully removed."
+            else
+                return 1
+            fi
         fi
-        log_success "Cleanup completed: $total_deletions duplicate(s) successfully removed."
     fi
 }
 
@@ -859,12 +1492,9 @@ op_duplicate_workflow() {
         printf "  [b] Back to main menu\n\n" >&2
         printf "Selection [1-5, b]: " >&2
 
-        local subchoice
-        if [[ -t 0 ]]; then
-            read -r subchoice </dev/tty || subchoice="b"
-        else
-            read -r subchoice || subchoice="b"
-        fi
+        local subchoice=""
+        read_tty_line subchoice
+        subchoice="${subchoice:-b}"
 
         case "$subchoice" in
             1)
@@ -904,28 +1534,48 @@ run_interactive_wizard() {
 
     while true; do
         local raw_json
-        raw_json="$(fetch_vault_json)"
+        if ! raw_json="$(fetch_vault_json)"; then
+            exit 1
+        fi
 
         printf "\n${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${RESET}\n"
         printf "${BOLD}${CYAN}║     VAULTWARDEN & BITWARDEN MAINTENANCE WIZARD                       ║${RESET}\n"
         printf "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${RESET}\n"
+        if [[ -n "$CONNECTED_ACCOUNT" ]]; then
+            printf " ${DIM}Connected: %s (%s)${RESET}\n\n" "$EXEC_TARGET" "$CONNECTED_ACCOUNT"
+        fi
         printf " [1] Fix KeePass URLs (migrate URLs from notes/fields into URI matches)\n"
         printf " [2] Fix missing / generic names (restore 'Domain (Username)')\n"
         printf " [3] Analyze & resolve duplicates (smart multi-tier audit & merge)\n"
+        if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
+            printf " [l] Logout Bitwarden CLI session\n"
+        fi
         printf " [q] Quit\n\n"
-        printf "Selection [1-3, q]: "
-
-        local menu_choice
-        if [[ -t 0 ]]; then
-            read -r menu_choice </dev/tty || menu_choice="q"
+        if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
+            printf "Selection [1-3, l, q]: "
         else
-            read -r menu_choice || menu_choice="q"
+            printf "Selection [1-3, q]: "
         fi
 
+        local menu_choice=""
+        read_tty_line menu_choice
+        menu_choice="${menu_choice:-q}"
+
         case "$menu_choice" in
-            1) op_fix_uris "$raw_json" ;;
-            2) op_fix_names "$raw_json" ;;
-            3) op_duplicate_workflow "$raw_json" ;;
+            1) op_fix_uris "$raw_json" || true ;;
+            2) op_fix_names "$raw_json" || true ;;
+            3) op_duplicate_workflow "$raw_json" || true ;;
+            l|L)
+                if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
+                    run_bw_capture logout --nointeraction || true
+                    BW_SESSION=""
+                    export BW_SESSION
+                    log_success "Logged out of Bitwarden CLI."
+                    break
+                else
+                    log_error "Invalid selection: $menu_choice"
+                fi
+                ;;
             q|Q)
                 log_info "Interactive wizard closed."
                 break
@@ -936,11 +1586,8 @@ run_interactive_wizard() {
         esac
 
         printf "\nPress Enter for main menu..."
-        if [[ -t 0 ]]; then
-            read -r _ </dev/tty || true
-        else
-            read -r _ || true
-        fi
+        local _pause=""
+        read_tty_line _pause
     done
 }
 
@@ -957,21 +1604,34 @@ main() {
                 INTERACTIVE=true
                 shift
                 ;;
+            --server)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a URL argument."; usage; }
+                SERVER_URL="$2"
+                shift 2
+                ;;
+            --bootstrap-bw)
+                BOOTSTRAP_BW=true
+                shift
+                ;;
             --file)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a file path."; usage; }
                 INPUT_FILE="$2"
                 EXEC_TARGET="file"
                 shift 2
                 ;;
             --output)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a file path."; usage; }
                 OUTPUT_FILE="$2"
                 shift 2
                 ;;
             --mock-bw)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a directory path."; usage; }
                 MOCK_BW_DIR="$2"
                 EXEC_TARGET="mock"
                 shift 2
                 ;;
             --docker)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a container name or ID."; usage; }
                 DOCKER_CONTAINER="$2"
                 EXEC_TARGET="docker"
                 shift 2
@@ -981,6 +1641,7 @@ main() {
                 shift
                 ;;
             --tier)
+                [[ $# -lt 2 ]] && { log_error "Option '$1' requires a tier name."; usage; }
                 tier="$2"
                 shift 2
                 ;;
@@ -998,25 +1659,7 @@ main() {
         esac
     done
 
-    # Normalize MOCK_BW_DIR if subfolder mock_vault exists
-    if [[ "$EXEC_TARGET" == "mock" && -n "$MOCK_BW_DIR" ]]; then
-        if [[ ! -f "$MOCK_BW_DIR/items.json" && -f "$MOCK_BW_DIR/mock_vault/items.json" ]]; then
-            MOCK_BW_DIR="$MOCK_BW_DIR/mock_vault"
-        fi
-    fi
-
-    # If no command passed and -i is requested (or invoked bare), enter wizard
-    if [[ -z "$command" ]]; then
-        if [[ "$INTERACTIVE" == true ]] || [[ $# -eq 0 && -t 0 ]]; then
-            INTERACTIVE=true
-        else
-            log_error "No command specified. Use -i for interactive mode or -h for help."
-            usage
-        fi
-    fi
-
     if [[ "$command" == "test-run" ]]; then
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         if [[ -f "$SCRIPT_DIR/tests/run_tests.sh" ]]; then
             exec "$SCRIPT_DIR/tests/run_tests.sh"
         elif [[ -f "./tests/run_tests.sh" ]]; then
@@ -1027,13 +1670,34 @@ main() {
         fi
     fi
 
+    # Normalize MOCK_BW_DIR if subfolder mock_vault exists
+    if [[ "$EXEC_TARGET" == "mock" && -n "$MOCK_BW_DIR" ]]; then
+        if [[ ! -f "$MOCK_BW_DIR/items.json" && -f "$MOCK_BW_DIR/mock_vault/items.json" ]]; then
+            MOCK_BW_DIR="$MOCK_BW_DIR/mock_vault"
+        fi
+    fi
+
+    # If no command passed and -i is requested (or invoked on an interactive terminal), enter wizard
+    if [[ -z "$command" ]]; then
+        if [[ "$INTERACTIVE" == true ]] || [[ -t 0 ]]; then
+            INTERACTIVE=true
+        else
+            log_error "No command specified. Use -i for interactive mode or -h for help."
+            usage
+        fi
+    fi
+
     log_info "Initializing [Target: ${BOLD}$EXEC_TARGET${RESET}, Mode: ${BOLD}$MODE${RESET}, Interactive: ${BOLD}$INTERACTIVE${RESET}]"
-    local vault_data
-    vault_data="$(fetch_vault_json)"
+    prepare_target_environment
 
     if [[ "$INTERACTIVE" == true && -z "$command" ]]; then
         run_interactive_wizard
         exit 0
+    fi
+
+    local vault_data
+    if ! vault_data="$(fetch_vault_json)"; then
+        exit 1
     fi
 
     case "$command" in

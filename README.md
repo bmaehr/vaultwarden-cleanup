@@ -11,6 +11,12 @@ A robust Bash and `jq` toolkit with two operational modes:
 Launch the interactive wizard against an exported JSON file or directly with your Vaultwarden setup:
 
 ```bash
+# Live against your Vaultwarden server (auto-downloads standalone './.bin/bw' if missing,
+# guides through server URL, login/2FA/API key, unlock, and vault sync)
+./vault_manager.sh -i
+# or specify the server URL up front:
+./vault_manager.sh -i --server https://vault.example.com
+
 # Offline simulation against mock Bitwarden environment
 ./vault_manager.sh -i --mock-bw tests/mock_vault
 # (or simply: ./vault_manager.sh -i --mock-bw tests)
@@ -18,12 +24,12 @@ Launch the interactive wizard against an exported JSON file or directly with you
 # Against an exported JSON file
 ./vault_manager.sh -i --file tests/fixture_all.json
 
-# Against live Bitwarden CLI (local session)
+# Against an existing unlocked local Bitwarden CLI session
 export BW_SESSION="your_session_key"
 ./vault_manager.sh -i
 
-# Against Docker container
-./vault_manager.sh -i --docker vaultwarden-cli
+# Against a dedicated Bitwarden CLI Docker container (note: NOT the vaultwarden/server container)
+./vault_manager.sh -i --docker bw-cli-container
 ```
 
 ### Interactive Workflow:

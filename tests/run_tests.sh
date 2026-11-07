@@ -126,6 +126,98 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# --- 7. Live Bitwarden CLI (.bin/bw) & Docker Error Diagnostics ---
+TMP_TEST_DIR="$(mktemp -d)"
+MOCK_STATE_JSON="$TMP_TEST_DIR/bw_state.json"
+MOCK_LIVE_ITEMS="$TMP_TEST_DIR/live_items.json"
+
+# Install simulated bw into ./.bin/bw temporarily if no real ./.bin/bw exists
+CLEANUP_LOCAL_BIN=false
+if [[ ! -e "$PARENT_DIR/.bin/bw" ]]; then
+    mkdir -p "$PARENT_DIR/.bin"
+    cp "$SCRIPT_DIR/mock_bw.sh" "$PARENT_DIR/.bin/bw"
+    chmod +x "$PARENT_DIR/.bin/bw"
+    CLEANUP_LOCAL_BIN=true
+fi
+
+# 10.1: Non-silent error on missing/stopped Docker container
+out_docker_err=$("$BIN" --docker nonexistent_container_xyz123 find-duplicates 2>&1 || true)
+assert_contains "$out_docker_err" "nonexistent_container_xyz123" "10.1: Reports clear error when Docker container is missing/stopped"
+
+# 10.2: Non-interactive unauthenticated check via ./.bin/bw
+cp "$SCRIPT_DIR/fixture_generic_names.json" "$MOCK_LIVE_ITEMS"
+out_unauth=$(PATH="/usr/bin:/bin" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" "$BIN" find-duplicates 2>&1 || true)
+assert_contains "$out_unauth" "status: unauthenticated" "10.2: Detects ./.bin/bw and reports unauthenticated status clearly"
+
+# 10.3: Interactive server config + login + sync + multi-item update via ./.bin/bw
+rm -f "$MOCK_STATE_JSON"
+cp "$SCRIPT_DIR/fixture_generic_names.json" "$MOCK_LIVE_ITEMS"
+# Inputs: server URL -> method 1 -> email -> password -> menu 2 (fix-names) -> confirm 'y' -> Enter -> menu 'q'
+out_interactive_live=$(printf "vault.example.com\n1\nadmin@example.com\ncorrect-horse-battery\n2\ny\n\nq\n" | \
+    PATH="/usr/bin:/bin" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" "$BIN" -i 2>&1)
+assert_contains "$out_interactive_live" "Configured server: https://vault.example.com" "10.3: Normalizes and configures Vaultwarden server URL"
+assert_contains "$out_interactive_live" "Vault synchronized" "10.4: Authenticates, unlocks, and synchronizes vault"
+assert_contains "$out_interactive_live" "2 item(s) successfully updated" "10.5: Updates all modified items via CLI loop without stdin loss"
+
+live_renamed_count=$(jq '[.[] | select(.name == "login.microsoftonline.com (b.maehr@mvb-online.de)" or .name == "pve-cluster.lan (admin)")] | length' "$MOCK_LIVE_ITEMS")
+if [[ "$live_renamed_count" -eq 2 ]]; then
+    printf "${GREEN}[PASS]${NC} 10.6: Both renamed items persisted via simulated 'bw encode' + 'bw edit'\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 10.6: Expected 2 renamed items in live store, found %d\n" "$live_renamed_count"
+    fail_count=$((fail_count + 1))
+fi
+
+# 10.7: Canonical update failure prevents deleting redundant duplicates (Data Loss Armor)
+cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
+orig_dup_len=$(jq 'length' "$MOCK_LIVE_ITEMS")
+out_fail_edit=$(PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" MOCK_BW_FAIL_EDIT_ID="aaaa1111-0000-0000-0000-000000000001" "$BIN" --apply merge-duplicates 2>&1 || true)
+assert_contains "$out_fail_edit" "Skipping deletion of duplicates" "10.7: Skips deleting duplicates when canonical update fails"
+surviving_dup=$(jq '[.[] | select(.id == "aaaa1111-0000-0000-0000-000000000002")] | length' "$MOCK_LIVE_ITEMS")
+if [[ "$surviving_dup" -eq 1 ]]; then
+    printf "${GREEN}[PASS]${NC} 10.8: Redundant item preserved when canonical edit failed\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 10.8: Redundant item was deleted despite canonical update failure\n"
+    fail_count=$((fail_count + 1))
+fi
+
+# 10.9 & 10.10: Passing --docker <vaultwarden_server_id> detects missing 'bw', extracts DOMAIN, and switches to ./.bin/bw
+cat > "$TMP_TEST_DIR/docker" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    inspect)
+        fmt="${3:-}"
+        if [[ "$fmt" == *"State.Running"* ]]; then
+            echo "true"
+        elif [[ "$fmt" == *"Config.Image"* ]]; then
+            echo "vaultwarden/server:latest"
+        elif [[ "$fmt" == *"Config.Env"* ]]; then
+            printf "DOMAIN=https://vw.internal.lan/\nSIGNUPS_ALLOWED=false\n"
+        fi
+        ;;
+    exec)
+        # Simulate container without 'bw'
+        exit 127
+        ;;
+    ps)
+        echo "7a14e94830e4 vaultwarden/server:latest"
+        ;;
+esac
+EOF
+chmod +x "$TMP_TEST_DIR/docker"
+rm -f "$MOCK_STATE_JSON"
+# Inputs: '' (Yes, switch to local ./.bin/bw) -> '' (Accept detected DOMAIN https://vw.internal.lan) -> 'q' (quit auth)
+out_vw_switch=$(printf "\n\nq\n" | \
+    PATH="$TMP_TEST_DIR:/usr/bin:/bin" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" "$BIN" --interactive --docker 7a14e94830e4 2>&1)
+assert_contains "$out_vw_switch" "does not contain the Bitwarden CLI" "10.9: Detects vaultwarden/server container lacking 'bw' and offers local fallback"
+assert_contains "$out_vw_switch" "Configured server: https://vw.internal.lan" "10.10: Auto-detects DOMAIN from Vaultwarden container as default server URL"
+
+if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
+    rm -rf "$PARENT_DIR/.bin"
+fi
+rm -rf "$TMP_TEST_DIR"
+
 # Restore full fixture into mock store for interactive testing
 cp "$SCRIPT_DIR/fixture_all.json" "$SCRIPT_DIR/mock_vault/items.json"
 
