@@ -1,0 +1,46 @@
+[
+  {
+    "id": "33333333-3333-3333-3333-333333333333",
+    "type": 1,
+    "name": "https://login.microsoftonline.com",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "AzurePassword1!",
+      "uris": [
+        {
+          "uri": "https://login.microsoftonline.com/common/oauth2",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "44444444-4444-4444-4444-444444444444",
+    "type": 1,
+    "name": "",
+    "login": {
+      "username": "admin",
+      "password": "AdminPassword!",
+      "uris": [
+        {
+          "uri": "https://pve-cluster.lan:8006",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "55555555-5555-5555-5555-555555555555",
+    "type": 1,
+    "name": "Already Proper Name",
+    "login": {
+      "username": "bernhard",
+      "uris": [
+        {
+          "uri": "https://github.com",
+          "match": 0
+        }
+      ]
+    }
+  }
+]

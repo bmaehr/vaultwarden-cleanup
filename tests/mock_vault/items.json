@@ -1,0 +1,154 @@
+[
+  {
+    "id": "aaaa1111-0000-0000-0000-000000000001",
+    "type": 1,
+    "name": "app.teamgantt.com",
+    "creationDate": "2024-01-10T10:00:00Z",
+    "revisionDate": "2024-01-10T10:00:00Z",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "GanttPassword123!",
+      "uris": [
+        {
+          "uri": "https://app.teamgantt.com",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "aaaa1111-0000-0000-0000-000000000002",
+    "type": 1,
+    "name": "app.teamgantt.com",
+    "creationDate": "2024-01-10T10:00:00Z",
+    "revisionDate": "2024-01-10T10:00:00Z",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "GanttPassword123!",
+      "uris": [
+        {
+          "uri": "https://app.teamgantt.com",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "bbbb2222-0000-0000-0000-000000000001",
+    "type": 1,
+    "name": "lucid.app",
+    "creationDate": "2023-05-01T08:00:00Z",
+    "revisionDate": "2023-05-01T08:00:00Z",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "LucidPassword999",
+      "uris": [
+        {
+          "uri": "https://lucid.app",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "bbbb2222-0000-0000-0000-000000000002",
+    "type": 1,
+    "name": "lucid.app",
+    "creationDate": "2024-09-15T12:30:00Z",
+    "revisionDate": "2024-09-15T12:30:00Z",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "LucidPassword999",
+      "uris": [
+        {
+          "uri": "https://lucid.app",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "cccc3333-0000-0000-0000-000000000001",
+    "type": 1,
+    "name": "login.microsoftonline.com",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "OldPassword2024",
+      "uris": [
+        {
+          "uri": "https://login.microsoftonline.com",
+          "match": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "cccc3333-0000-0000-0000-000000000002",
+    "type": 1,
+    "name": "login.microsoftonline.com",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "OldPassword2024",
+      "uris": [
+        {
+          "uri": "https://login.microsoftonline.com",
+          "match": 0
+        }
+      ],
+      "fido2Credentials": [
+        {
+          "credentialId": "dGhpcy1pcy1hLXRlc3QtcGFzc2tleQ==",
+          "rpId": "login.microsoftonline.com",
+          "userHandle": "dXNlci0xMjM=",
+          "userName": "b.maehr@mvb-online.de"
+        }
+      ]
+    }
+  },
+  {
+    "id": "dddd4444-0000-0000-0000-000000000001",
+    "type": 1,
+    "name": "email.android.com",
+    "notes": "First setup on Xiaomi",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "MailPasswordABC",
+      "uris": [
+        {
+          "uri": "https://email.android.com",
+          "match": 0
+        }
+      ]
+    },
+    "fields": [
+      {
+        "name": "ServerPort",
+        "value": "993",
+        "type": 0
+      }
+    ]
+  },
+  {
+    "id": "dddd4444-0000-0000-0000-000000000002",
+    "type": 1,
+    "name": "email.android.com",
+    "notes": "Added on tablet",
+    "login": {
+      "username": "b.maehr@mvb-online.de",
+      "password": "MailPasswordABC",
+      "uris": [
+        {
+          "uri": "https://email.android.com",
+          "match": 0
+        }
+      ]
+    },
+    "fields": [
+      {
+        "name": "ImapHost",
+        "value": "mail.mvb-online.de",
+        "type": 0
+      }
+    ]
+  }
+]
