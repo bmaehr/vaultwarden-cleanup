@@ -588,33 +588,38 @@ ensure_bw_authenticated() {
                         continue
                     fi
 
-                    if BW_PASSWORD="$bw_pw" run_bw_capture login "$bw_email" --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
-                        BW_SESSION="$CAPTURED_STDOUT"
-                        export BW_SESSION
-                        unset bw_pw
-                        log_success "Logged in and unlocked vault."
-                        continue
-                    fi
-
-                    local combined_err="${CAPTURED_STDERR} ${CAPTURED_STDOUT}"
-                    if [[ "$combined_err" =~ [Tt]wo-[Ss]tep|2FA|[Tt]wo[Ff]actor|two[[:space:]]factor|verification[[:space:]]code|totp|[Mm]ethod ]] && [[ -r /dev/tty ]]; then
-                        log_info "Two-step login (2FA) detected — switching to interactive 2FA prompt..."
+                    if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+                        log_info "Authenticating with server (if prompted, enter your 2FA / verification code)..."
                         local interactive_rc=0
                         BW_PASSWORD="$bw_pw" run_bw_exec --tty login "$bw_email" --passwordenv BW_PASSWORD </dev/tty >/dev/tty 2>/dev/tty || interactive_rc=$?
                         if [[ $interactive_rc -eq 0 ]]; then
                             if BW_PASSWORD="$bw_pw" run_bw_capture unlock --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
                                 BW_SESSION="$CAPTURED_STDOUT"
                                 export BW_SESSION
+                                unset BW_PASSWORD bw_pw
+                                log_success "Logged in and captured active vault session."
+                                continue
                             fi
-                            unset bw_pw
+                            unset BW_PASSWORD bw_pw
+                            log_error "Login succeeded, but automatic session unlock failed:"
+                            print_bw_error_details
                             continue
                         fi
-                        unset bw_pw
-                        log_error "Interactive two-step login did not complete."
+                        unset BW_PASSWORD bw_pw
+                        log_error "Login did not complete."
+                        log_info "Tip: If your account uses Passkey / FIDO2 WebAuthn-only 2FA (unsupported by CLI), choose [2] Personal API Key."
                         continue
                     fi
 
-                    unset bw_pw
+                    if BW_PASSWORD="$bw_pw" run_bw_capture login "$bw_email" --passwordenv BW_PASSWORD --nointeraction --raw && [[ -n "$CAPTURED_STDOUT" ]]; then
+                        BW_SESSION="$CAPTURED_STDOUT"
+                        export BW_SESSION
+                        unset BW_PASSWORD bw_pw
+                        log_success "Logged in and unlocked vault."
+                        continue
+                    fi
+
+                    unset BW_PASSWORD bw_pw
                     log_error "Login failed:"
                     print_bw_error_details
                     ;;
