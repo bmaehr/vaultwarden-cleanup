@@ -23,11 +23,12 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 # --- Configurations ---
 MODE="preview"            # "preview" (default dry-run) or "apply"
 INTERACTIVE=false         # Set to true when called with -i / --interactive or no arguments
+VERBOSE=false             # Set to true via -v / --verbose or wizard toggle
 EXEC_TARGET="local"       # "local", "docker", "file", or "mock"
 DOCKER_CONTAINER=""
 INPUT_FILE=""
@@ -41,6 +42,8 @@ CONNECTED_ACCOUNT=""
 DETECTED_SERVER_HINT=""
 CAPTURED_STDOUT=""
 CAPTURED_STDERR=""
+VERBOSE_DECISION="no"
+WORKING_VAULT_JSON=""
 
 # Terminal styling (protected against unset TERM / set -e failure)
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
@@ -189,6 +192,38 @@ prompt_confirmation() {
     esac
 }
 
+# Interactive per-item confirmation prompt (used in interactive + verbose mode)
+prompt_verbose_item_decision() {
+    local label="$1"
+    while true; do
+        printf "\n  ${BOLD}${YELLOW}%s${RESET}\n" "$label" >&2
+        printf "  [y] Apply  [n] Skip (Default)  [a] Apply all remaining  [q] Cancel remaining: " >&2
+        local choice=""
+        read_tty_line choice
+        case "$choice" in
+            [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
+                VERBOSE_DECISION="yes"
+                return 0
+                ;;
+            ""|[nN]|[nN][oO]|[nN][eE][iI][nN])
+                VERBOSE_DECISION="no"
+                return 0
+                ;;
+            [aA]|[aA][lL][lL])
+                VERBOSE_DECISION="all"
+                return 0
+                ;;
+            [qQ]|[qQ][uU][iI][tT])
+                VERBOSE_DECISION="quit"
+                return 0
+                ;;
+            *)
+                log_error "Please enter y (apply), n (skip), a (apply all remaining), or q (cancel)."
+                ;;
+        esac
+    done
+}
+
 usage() {
     local exit_code="${1:-1}"
     cat <<EOF
@@ -198,10 +233,11 @@ Usage: $SCRIPT_NAME [OPTIONS] [COMMAND]
 
 ${BOLD}Interactive Mode:${RESET}
   $SCRIPT_NAME -i               Start interactive wizard (auto-bootstraps 'bw', login/unlock, plan & confirm)
+  $SCRIPT_NAME -i -v            Start wizard in verbose mode (per-item diff & step-by-step [y/n/a/q] prompt)
 
 ${BOLD}Commands:${RESET}
   ${CYAN}fix-uris${RESET}             Extract URLs from notes/fields into login.uris (KeePass cleanup)
-  ${CYAN}fix-names${RESET}            Generate meaningful names for entries with empty/raw URL titles
+  ${CYAN}fix-names${RESET}            Generate names ('Domain (Username)') for entries without a name
   ${CYAN}find-duplicates${RESET}      Locate duplicate items across multiple strictness tiers:
                          --tier exact    : Strict. Timestamps (creation/revision) must match.
                          --tier content  : Payload match. Ignores timestamps and IDs.
@@ -212,6 +248,7 @@ ${BOLD}Commands:${RESET}
 
 ${BOLD}Options:${RESET}
   -i, --interactive    Interactive wizard mode with step-by-step confirmation
+  -v, --verbose        Show full per-item before/after diffs (secrets masked) & step-by-step prompts
   --server <url>       Vaultwarden / Bitwarden server URL (e.g. https://vault.example.com)
   --bootstrap-bw       Automatically download standalone 'bw' CLI into ./.bin/bw if missing
   --file <path>        Operate on a local JSON export file directly (no bw instance required)
@@ -223,14 +260,14 @@ ${BOLD}Options:${RESET}
   -h, --help           Show this help message
 
 ${BOLD}Examples:${RESET}
-  # Live Interactive Wizard against Vaultwarden (auto-installs ./.bin/bw if needed):
-  $SCRIPT_NAME -i --server https://vault.example.com
+  # Live Interactive Wizard in Verbose Mode:
+  $SCRIPT_NAME -i -v --server https://vault.example.com
 
   # Offline Interactive Wizard (simulation):
   $SCRIPT_NAME --interactive --mock-bw tests/mock_vault
 
-  # Direct CLI preview:
-  $SCRIPT_NAME --file tests/fixture_duplicates.json find-duplicates --tier content
+  # Verbose Dry-Run CLI preview:
+  $SCRIPT_NAME -v --file tests/fixture_duplicates.json merge-duplicates
 EOF
     exit "$exit_code"
 }
@@ -807,57 +844,392 @@ fetch_vault_json() {
 
 bw_update_item() {
     local item_json="$1"
-    local item_id
-    item_id="$(printf '%s\n' "$item_json" | jq -r '.id')"
+    local item_idx="${2:-}"
+    local item_id item_name
+    item_id="$(printf '%s\n' "$item_json" | jq -r '.id // empty')"
+    item_name="$(printf '%s\n' "$item_json" | jq -r '.name // "<empty>"')"
 
-    if ! run_bw_stdin "$item_json" encode; then
-        log_error "Failed to encode item '$item_id':"
-        print_bw_error_details
+    if [[ "$VERBOSE" == true ]]; then
+        log_info "[VERBOSE] Updating item ${item_id:-no-id} ('$item_name')..."
+    fi
+
+    if [[ "$EXEC_TARGET" == "mock" ]]; then
+        jq --arg id "$item_id" --arg idx "$item_idx" --argjson updated "$item_json" '
+          if ($id != "") then
+            map(if .id == $id then $updated else . end)
+          elif ($idx != "") then
+            to_entries | map(if .key == ($idx | tonumber) then $updated else .value end)
+          else
+            .
+          end
+        ' "$MOCK_BW_DIR/items.json" > "$MOCK_BW_DIR/items.json.tmp"
+        mv "$MOCK_BW_DIR/items.json.tmp" "$MOCK_BW_DIR/items.json"
+    elif [[ -n "$OUTPUT_FILE" ]]; then
+        WORKING_VAULT_JSON="$(printf '%s\n' "$WORKING_VAULT_JSON" | jq \
+          --arg id "$item_id" --arg idx "$item_idx" --argjson updated "$item_json" '
+          if ($id != "") then
+            map(if .id == $id then $updated else . end)
+          elif ($idx != "") then
+            to_entries | map(if .key == ($idx | tonumber) then $updated else .value end)
+          else
+            .
+          end
+        ')"
+        printf '%s\n' "$WORKING_VAULT_JSON" > "$OUTPUT_FILE"
+    elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
+        if ! run_bw_stdin "$item_json" encode; then
+            log_error "Failed to encode item '${item_id:-no-id}':"
+            print_bw_error_details
+            return 1
+        fi
+        local encoded_item="$CAPTURED_STDOUT"
+
+        if ! run_bw_stdin "$encoded_item" edit item "$item_id" --nointeraction; then
+            log_error "Failed to update item '${item_id:-no-id}':"
+            print_bw_error_details
+            return 1
+        fi
+    else
+        log_error "Input '--file' mode is read-only. Specify '--output <file>' to save changes."
         return 1
     fi
-    local encoded_item="$CAPTURED_STDOUT"
 
-    if ! run_bw_stdin "$encoded_item" edit item "$item_id" --nointeraction; then
-        log_error "Failed to update item '$item_id':"
-        print_bw_error_details
-        return 1
+    if [[ "$VERBOSE" == true ]]; then
+        log_success "[VERBOSE] Item ${item_id:-no-id} ('$item_name') updated."
     fi
     return 0
 }
 
-apply_deletions() {
-    local ids_to_delete=("$@")
-    local total="${#ids_to_delete[@]}"
-    local current=0 deleted_ok=0 deleted_fail=0
-
-    [[ "$total" -eq 0 ]] && return 0
-
-    printf "\n" >&2
-    log_info "Applying deletions for $total items..."
-    for id in "${ids_to_delete[@]}"; do
-        current=$((current + 1))
-        render_progress "$current" "$total" "Deleting items"
-        
-        if [[ "$EXEC_TARGET" == "mock" ]]; then
-            jq --arg item_id "$id" 'map(select(.id != $item_id))' "$MOCK_BW_DIR/items.json" > "$MOCK_BW_DIR/items.json.tmp"
-            mv "$MOCK_BW_DIR/items.json.tmp" "$MOCK_BW_DIR/items.json"
-            deleted_ok=$((deleted_ok + 1))
-        elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
-            if run_bw_capture delete item "$id" --nointeraction; then
-                deleted_ok=$((deleted_ok + 1))
-            else
-                deleted_fail=$((deleted_fail + 1))
-                log_error "Failed to delete item '$id':"
-                print_bw_error_details
-            fi
+bw_delete_single_item() {
+    local id="$1"
+    local label="${2:-}"
+    if [[ "$VERBOSE" == true ]]; then
+        log_info "[VERBOSE] Deleting redundant item $id${label:+ ('$label')}..."
+    fi
+    if [[ "$EXEC_TARGET" == "mock" ]]; then
+        jq --arg item_id "$id" 'map(select(.id != $item_id))' "$MOCK_BW_DIR/items.json" > "$MOCK_BW_DIR/items.json.tmp"
+        mv "$MOCK_BW_DIR/items.json.tmp" "$MOCK_BW_DIR/items.json"
+    elif [[ -n "$OUTPUT_FILE" ]]; then
+        WORKING_VAULT_JSON="$(printf '%s\n' "$WORKING_VAULT_JSON" | jq --arg item_id "$id" 'map(select(.id != $item_id))')"
+        printf '%s\n' "$WORKING_VAULT_JSON" > "$OUTPUT_FILE"
+    elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
+        if ! run_bw_capture delete item "$id" --nointeraction; then
+            log_error "Failed to delete item '$id':"
+            print_bw_error_details
+            return 1
         fi
-    done
-
-    if [[ $deleted_fail -gt 0 ]]; then
-        log_warn "Deleted $deleted_ok item(s); $deleted_fail deletion(s) failed."
+    else
+        log_error "Input '--file' mode is read-only. Specify '--output <file>' to save changes."
         return 1
     fi
+    if [[ "$VERBOSE" == true ]]; then
+        log_success "[VERBOSE] Redundant item $id deleted."
+    fi
     return 0
+}
+
+# Unified item-update executor: changing one vs changing all runs the exact same
+# single-item update path, either asking per item (-i -v) or iterating over all.
+apply_modified_items_plan() {
+    local raw_json="$1"
+    local transformed_json="$2"
+    local modified_count="$3"
+    local card_fn="$4"
+    local batch_label="$5"
+    local item_prompt_noun="$6"
+    local mock_noun="${7:-item(s)}"
+
+    local preview_only=false
+    local ask_each=false
+    if [[ "$INTERACTIVE" == true ]]; then
+        if [[ "$VERBOSE" == true ]]; then
+            ask_each=true
+        else
+            if ! prompt_confirmation "$batch_label"; then
+                return 0
+            fi
+        fi
+    elif [[ "$MODE" == "preview" ]]; then
+        preview_only=true
+    fi
+
+    if [[ "$preview_only" != true && "$EXEC_TARGET" == "file" && -z "$OUTPUT_FILE" ]]; then
+        log_error "Input '--file' mode is read-only. Re-run with '--output <file>' to save changes."
+        return 1
+    fi
+
+    if [[ "$preview_only" == true && "$VERBOSE" != true ]]; then
+        printf "\n" >&2
+        log_warn "[DRY-RUN] No changes written. Run with -i or --apply to execute."
+        return 0
+    fi
+
+    WORKING_VAULT_JSON="$raw_json"
+    local mod_items curr=0 ok_count=0 skip_count=0 fail_count_upd=0 raw_item
+    mod_items=$(echo "$transformed_json" | jq -c '.[] | select(._modified == true)')
+
+    while IFS= read -r -u 3 raw_item; do
+        [[ -z "$raw_item" ]] && continue
+        curr=$((curr + 1))
+
+        if [[ "$VERBOSE" == true ]]; then
+            "$card_fn" "$curr" "$modified_count" "$raw_item"
+        else
+            render_progress "$curr" "$modified_count" "Updating items"
+        fi
+
+        [[ "$preview_only" == true ]] && continue
+
+        if [[ "$ask_each" == true ]]; then
+            prompt_verbose_item_decision "$item_prompt_noun [$curr/$modified_count]?"
+            case "$VERBOSE_DECISION" in
+                no)
+                    skip_count=$((skip_count + 1))
+                    log_info "Skipped item [$curr/$modified_count]."
+                    continue
+                    ;;
+                quit)
+                    local rem=$((modified_count - curr + 1))
+                    log_warn "Cancelled remaining $rem item(s)."
+                    break
+                    ;;
+                all)
+                    ask_each=false
+                    ;;
+            esac
+        fi
+
+        local item_idx clean_item
+        item_idx=$(printf '%s\n' "$raw_item" | jq -r '._idx // empty')
+        clean_item=$(printf '%s\n' "$raw_item" | jq -c 'del(._idx, ._modified, ._added_uris, ._old_uris, ._old_name)')
+
+        if bw_update_item "$clean_item" "$item_idx"; then
+            ok_count=$((ok_count + 1))
+        else
+            fail_count_upd=$((fail_count_upd + 1))
+        fi
+    done 3<<< "$mod_items"
+
+    if [[ "$preview_only" == true ]]; then
+        printf "\n" >&2
+        log_warn "[DRY-RUN] No changes written. Run with -i or --apply to execute."
+        return 0
+    fi
+
+    local skip_note=""
+    [[ $skip_count -gt 0 ]] && skip_note=" ($skip_count skipped)"
+
+    if [[ "$EXEC_TARGET" == "mock" ]]; then
+        if [[ $ok_count -eq 0 && $fail_count_upd -eq 0 ]]; then
+            log_warn "No items were modified (0 updated${skip_note})."
+        elif [[ $fail_count_upd -eq 0 ]]; then
+            log_success "[MOCK BW] $ok_count $mock_noun updated in $MOCK_BW_DIR/items.json${skip_note}."
+        else
+            log_warn "[MOCK BW] $ok_count $mock_noun updated, $fail_count_upd failed${skip_note}."
+        fi
+    elif [[ -n "$OUTPUT_FILE" ]]; then
+        if [[ $ok_count -eq 0 && $fail_count_upd -eq 0 ]]; then
+            log_warn "No items were modified (0 updated${skip_note})."
+        elif [[ $fail_count_upd -eq 0 ]]; then
+            log_success "$ok_count updated item(s) saved to: $OUTPUT_FILE${skip_note}."
+        else
+            log_warn "$ok_count item(s) saved to $OUTPUT_FILE, $fail_count_upd failed${skip_note}."
+        fi
+    else
+        if [[ $ok_count -eq 0 && $fail_count_upd -eq 0 ]]; then
+            log_warn "No items were modified (0 updated${skip_note})."
+        elif [[ $fail_count_upd -eq 0 ]]; then
+            log_success "$ok_count item(s) successfully updated${skip_note}."
+        else
+            log_warn "$ok_count item(s) updated, $fail_count_upd failed${skip_note}."
+        fi
+    fi
+
+    [[ $fail_count_upd -gt 0 ]] && return 1
+    return 0
+}
+
+# --- VERBOSE DIFF PRESENTERS (Secrets Masked) ---
+print_verbose_uri_diff_card() {
+    local idx="$1"
+    local total="$2"
+    local item_json="$3"
+
+    printf "\n" >&2
+    printf '%s\n' "$item_json" | jq -r \
+      --arg idx "$idx" \
+      --arg total "$total" \
+      --arg bold "$BOLD" \
+      --arg cyan "$CYAN" \
+      --arg green "$GREEN" \
+      --arg dim "$DIM" \
+      --arg reset "$RESET" '
+      def mask_pw(p):
+        if (p // "") == "" then "<empty>" else "******** (set, len \(p | length))" end;
+      def fmt_fields(f):
+        if (f // [] | length) == 0 then ["<none>"]
+        else [ f[] | if .type == 1 then "\(.name // "unnamed") = ******** (hidden)" else "\(.name // "unnamed") = \(.value // "")" end ]
+        end;
+      def fmt_notes(n; pad):
+        if (n // "") == "" then "<empty>"
+        else (n | split("\n") | join("\n" + pad))
+        end;
+
+      ($cyan + "┌─ [" + $idx + "/" + $total + "] " + $bold + "UPDATE ITEM: Migrate KeePass Web Match URIs" + $reset + $cyan + " ─────────────────────" + $reset),
+      ($cyan + "│" + $reset + " Item ID:   " + $bold + (.id // "no-id") + $reset),
+      ($cyan + "│" + $reset + " Name:      " + (.name // "<empty>")),
+      ($cyan + "│" + $reset + " Username:  " + (.login.username // "<empty>")),
+      ($cyan + "│" + $reset + " Password:  " + mask_pw(.login.password)),
+      (if (.login.totp // "") != "" then ($cyan + "│" + $reset + " TOTP:      ******** (configured)") else empty end),
+      ($cyan + "│" + $reset + " Notes:     " + fmt_notes(.notes; $cyan + "│" + $reset + "            ")),
+      (fmt_fields(.fields) | to_entries[] |
+        if .key == 0 then ($cyan + "│" + $reset + " Fields:    " + .value)
+        else ($cyan + "│" + $reset + "            " + .value)
+        end),
+      ($cyan + "│" + $reset + " " + $bold + "Changes to login.uris:" + $reset),
+      (if ((._old_uris // []) | length) == 0 then
+        ($cyan + "│" + $reset + "   " + $dim + "= Existing URI: <none>" + $reset)
+       else
+        (._old_uris[] | ($cyan + "│" + $reset + "   " + $dim + "= Existing URI: " + . + $reset))
+       end),
+      ((._added_uris // [])[] | ($cyan + "│" + $reset + "   " + $green + "+ Added URI:    " + . + " (match: default)" + $reset)),
+      ($cyan + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
+    ' >&2
+}
+
+print_verbose_name_diff_card() {
+    local idx="$1"
+    local total="$2"
+    local item_json="$3"
+
+    printf "\n" >&2
+    printf '%s\n' "$item_json" | jq -r \
+      --arg idx "$idx" \
+      --arg total "$total" \
+      --arg bold "$BOLD" \
+      --arg cyan "$CYAN" \
+      --arg yellow "$YELLOW" \
+      --arg green "$GREEN" \
+      --arg reset "$RESET" '
+      def mask_pw(p):
+        if (p // "") == "" then "<empty>" else "******** (set, len \(p | length))" end;
+      def fmt_fields(f):
+        if (f // [] | length) == 0 then ["<none>"]
+        else [ f[] | if .type == 1 then "\(.name // "unnamed") = ******** (hidden)" else "\(.name // "unnamed") = \(.value // "")" end ]
+        end;
+      def fmt_uris(u):
+        if (u // [] | length) == 0 then ["<none>"]
+        else [ u[] | .uri // "" ]
+        end;
+      def fmt_notes(n; pad):
+        if (n // "") == "" then "<empty>"
+        else (n | split("\n") | join("\n" + pad))
+        end;
+
+      ($cyan + "┌─ [" + $idx + "/" + $total + "] " + $bold + "UPDATE ITEM: Set Entry Name" + $reset + $cyan + " ────────────────────────────────────" + $reset),
+      ($cyan + "│" + $reset + " Item ID:   " + $bold + (.id // "no-id") + $reset),
+      ($cyan + "│" + $reset + " Username:  " + (.login.username // "<empty>")),
+      ($cyan + "│" + $reset + " Password:  " + mask_pw(.login.password)),
+      (fmt_uris(.login.uris) | to_entries[] |
+        if .key == 0 then ($cyan + "│" + $reset + " URIs:      " + .value)
+        else ($cyan + "│" + $reset + "            " + .value)
+        end),
+      ($cyan + "│" + $reset + " Notes:     " + fmt_notes(.notes; $cyan + "│" + $reset + "            ")),
+      (fmt_fields(.fields) | to_entries[] |
+        if .key == 0 then ($cyan + "│" + $reset + " Fields:    " + .value)
+        else ($cyan + "│" + $reset + "            " + .value)
+        end),
+      ($cyan + "│" + $reset + " " + $bold + "Changes to name:" + $reset),
+      ($cyan + "│" + $reset + "   " + $yellow + "- Before: " + (._old_name // "<empty>") + $reset),
+      ($cyan + "│" + $reset + "   " + $green + "+ After:  " + (.name // "<empty>") + $reset),
+      ($cyan + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
+    ' >&2
+}
+
+print_verbose_merge_cluster_card() {
+    local idx="$1"
+    local total="$2"
+    local cluster_json="$3"
+
+    printf "\n" >&2
+    printf '%s\n' "$cluster_json" | jq -r \
+      --arg idx "$idx" \
+      --arg total "$total" \
+      --arg bold "$BOLD" \
+      --arg cyan "$CYAN" \
+      --arg yellow "$YELLOW" \
+      --arg green "$GREEN" \
+      --arg red "$RED" \
+      --arg dim "$DIM" \
+      --arg reset "$RESET" '
+      def mask_pw(p):
+        if (p // "") == "" then "<empty>" else "******** (set, len \(p | length))" end;
+      def fmt_field_inline(f):
+        if (f // [] | length) == 0 then "<none>"
+        else ([ f[] | if .type == 1 then "\(.name // "unnamed")=********(hidden)" else "\(.name // "unnamed")=\(.value // "")" end ] | join(", "))
+        end;
+      def fmt_uris_inline(u):
+        if (u // [] | length) == 0 then "<none>"
+        else ([ u[] | .uri // "" ] | join(", "))
+        end;
+      def fmt_pk(item):
+        if (item.login.fido2Credentials // [] | length) > 0 then
+          "🔒 \(item.login.fido2Credentials | length) passkey(s) protected"
+        else "<none>" end;
+      def fmt_notes(n; pad):
+        if (n // "") == "" then "<empty>"
+        else (n | split("\n") | join("\n" + pad))
+        end;
+
+      if .status == "CONFLICT_MULTIPLE_PASSKEYS" then
+        ($yellow + "┌─ [Conflict " + $idx + "/" + $total + "] " + $bold + "SKIPPED — MULTIPLE PASSKEYS PROTECTED" + $reset + $yellow + " ──────────────────" + $reset),
+        ($yellow + "│" + $reset + " Reason:    " + (.reason // "Multiple FIDO2 passkeys")),
+        ((.conflict_items // [])[] |
+          ($yellow + "│" + $reset + " 🔒 Protected ID: " + $bold + (.id // "no-id") + $reset + " | Name: " + (.name // "<empty>") + " | User: " + (.login.username // "<empty>") + " | " + fmt_pk(.))
+        ),
+        ($yellow + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
+      else
+        .original_canonical as $orig |
+        .merged_item as $merged |
+        ($cyan + "┌─ [Cluster " + $idx + "/" + $total + "] " + $bold + "MERGE & DELETE DUPLICATE(S)" + $reset + $cyan + " ──────────────────────────────" + $reset),
+        ($cyan + "│" + $reset + " " + $bold + $green + "CANONICAL ITEM (KEPT):" + $reset),
+        ($cyan + "│" + $reset + "   Item ID:   " + $bold + ($orig.id // "no-id") + $reset),
+        ($cyan + "│" + $reset + "   Name:      " + ($orig.name // "<empty>")),
+        ($cyan + "│" + $reset + "   Username:  " + ($orig.login.username // "<empty>")),
+        ($cyan + "│" + $reset + "   Password:  " + mask_pw($orig.login.password)),
+        ($cyan + "│" + $reset + "   Passkeys:  " + fmt_pk($orig)),
+        ($cyan + "│" + $reset + "   Dates:     Created " + ($orig.creationDate // "N/A") + " | Revised " + ($orig.revisionDate // "N/A")),
+        (if .canonical_changed then
+          ($cyan + "│" + $reset + "   Action:    " + $yellow + "UPDATE CANONICAL ITEM (consolidating attributes from duplicate(s))" + $reset),
+          (if (.added_notes // "") != "" then
+            ($cyan + "│" + $reset + "   " + $yellow + "- Notes (before): " + fmt_notes($orig.notes; $cyan + "│" + $reset + "                     ") + $reset),
+            ($cyan + "│" + $reset + "   " + $green + "+ Notes (after):  " + fmt_notes($merged.notes; $cyan + "│" + $reset + "                     ") + $reset)
+           else empty end),
+          ((.added_fields // [])[] |
+            ($cyan + "│" + $reset + "   " + $green + "+ Merged Field:   " + (if .type == 1 then "\(.name // "unnamed") = ******** (hidden)" else "\(.name // "unnamed") = \(.value // "")" end) + $reset)
+          ),
+          ((.added_uris // [])[] |
+            ($cyan + "│" + $reset + "   " + $green + "+ Merged URI:     " + . + $reset)
+          )
+         else
+          ($cyan + "│" + $reset + "   Action:    " + $dim + "KEEP AS-IS (no edit needed; canonical already contains all attributes)" + $reset),
+          ($cyan + "│" + $reset + "   URIs:      " + fmt_uris_inline($orig.login.uris)),
+          ($cyan + "│" + $reset + "   Fields:    " + fmt_field_inline($orig.fields)),
+          ($cyan + "│" + $reset + "   Notes:     " + fmt_notes($orig.notes; $cyan + "│" + $reset + "              "))
+         end),
+        ($cyan + "│" + $reset),
+        ($cyan + "│" + $reset + " " + $bold + $red + "REDUNDANT DUPLICATE(S) TO DELETE (\(.redundant_items | length) item(s)):" + $reset),
+        ((.redundant_items // [])[] |
+          ($cyan + "│" + $reset + "   " + $red + "✖ DELETE ID: " + $bold + (.id // "no-id") + $reset),
+          ($cyan + "│" + $reset + "     Name:      " + (.name // "<empty>") + " | User: " + (.login.username // "<empty>") + " | Password: " + mask_pw(.login.password)),
+          ($cyan + "│" + $reset + "     Dates:     Created " + (.creationDate // "N/A") + " | Revised " + (.revisionDate // "N/A")),
+          ($cyan + "│" + $reset + "     URIs:      " + fmt_uris_inline(.login.uris)),
+          ($cyan + "│" + $reset + "     Fields:    " + fmt_field_inline(.fields)),
+          ($cyan + "│" + $reset + "     Notes:     " + fmt_notes(.notes; $cyan + "│" + $reset + "                "))
+        ),
+        ($cyan + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
+      end
+    ' >&2
 }
 
 # --- OPERATION 1: Fix URIs (KeePass Cleanup) ---
@@ -874,7 +1246,8 @@ op_fix_uris() {
       def extract_urls_from_text:
         [scan("(https?://[a-zA-Z0-9./?=_-]+)")] | map({uri: .[0], match: 0});
 
-      map(
+      to_entries | map(
+        .key as $idx | .value |
         if .type == 1 then
           . as $item |
           ($item.notes // "" | extract_urls_from_text) as $note_urls |
@@ -884,6 +1257,8 @@ op_fix_uris() {
           ($found_urls | map(select(.uri as $u | ($existing_uris | map(.uri) | index($u)) == null))) as $new_uris |
           
           if ($new_uris | length) > 0 then
+            ._idx = $idx |
+            ._old_uris = ($existing_uris | map(.uri)) |
             .login.uris = ($existing_uris + $new_uris) |
             ._modified = true |
             ._added_uris = ($new_uris | map(.uri))
@@ -917,53 +1292,20 @@ op_fix_uris() {
         return 0
     fi
 
-    # Interactive confirmation step
-    local effective_mode="$MODE"
-    if [[ "$INTERACTIVE" == true ]]; then
-        if prompt_confirmation "Update $modified_count item(s)"; then
-            effective_mode="apply"
-        else
-            return 0
-        fi
-    fi
-
-    if [[ "$effective_mode" == "preview" ]]; then
-        printf "\n" >&2
-        log_warn "[DRY-RUN] No changes written. Run with -i or --apply to execute."
-    elif [[ "$EXEC_TARGET" == "mock" ]]; then
-        echo "$transformed_json" | jq 'map(del(._modified, ._added_uris))' > "$MOCK_BW_DIR/items.json"
-        log_success "[MOCK BW] $modified_count item(s) updated in $MOCK_BW_DIR/items.json."
-    elif [[ -n "$OUTPUT_FILE" ]]; then
-        echo "$transformed_json" | jq 'map(del(._modified, ._added_uris))' > "$OUTPUT_FILE"
-        log_success "$modified_count updated item(s) saved to: $OUTPUT_FILE"
-    else
-        log_info "Sending updates to Bitwarden CLI..."
-        local items_to_update
-        items_to_update=$(echo "$transformed_json" | jq -c '.[] | select(._modified == true) | del(._modified, ._added_uris)')
-        local curr=0 ok_count=0 fail_count_upd=0 item_json
-        while IFS= read -r -u 3 item_json; do
-            [[ -z "$item_json" ]] && continue
-            curr=$((curr + 1))
-            render_progress "$curr" "$modified_count" "Updating items"
-            if bw_update_item "$item_json"; then
-                ok_count=$((ok_count + 1))
-            else
-                fail_count_upd=$((fail_count_upd + 1))
-            fi
-        done 3<<< "$items_to_update"
-        if [[ $fail_count_upd -eq 0 ]]; then
-            log_success "$ok_count item(s) successfully updated."
-        else
-            log_warn "$ok_count item(s) updated, $fail_count_upd failed."
-            return 1
-        fi
-    fi
+    apply_modified_items_plan \
+        "$raw_json" \
+        "$transformed_json" \
+        "$modified_count" \
+        "print_verbose_uri_diff_card" \
+        "Update $modified_count item(s)" \
+        "Apply URI migration" \
+        "item(s)"
 }
 
-# --- OPERATION 2: Fix Missing / Generic Names ---
+# --- OPERATION 2: Fix Missing Names ---
 op_fix_names() {
     local raw_json="$1"
-    log_header "OPERATION: Restore Descriptive Entry Names"
+    log_header "OPERATION: Generate Names for Unnamed Entries"
 
     local total_items
     total_items=$(echo "$raw_json" | jq 'length')
@@ -977,16 +1319,17 @@ op_fix_names() {
           (uri | sub("^https?://"; "") | sub("^www\\."; "") | split("/")[0] | split(":")[0])
         end;
 
-      map(
+      to_entries | map(
+        .key as $idx | .value |
         if .type == 1 then
           . as $item |
           ($item.login.uris[0].uri // "") as $uri |
           ($item.login.username // "") as $user |
           extract_domain($uri) as $dom |
           
-          ($item.name == null or $item.name == "" or ($item.name | test("^https?://")) or $item.name == $uri) as $is_generic |
+          ($item.name == null or (($item.name | gsub("^\\s+|\\s+$"; "")) == "")) as $is_missing |
           
-          if $is_generic and ($dom != "" or $user != "") then
+          if $is_missing and ($dom != "" or $user != "") then
             (if $dom != "" and $user != "" then
                "\($dom) (\($user))"
              elif $dom != "" then
@@ -996,7 +1339,8 @@ op_fix_names() {
              end) as $generated_name |
             
             if $item.name != $generated_name then
-              ._old_name = ($item.name // "<empty>") |
+              ._idx = $idx |
+              ._old_name = "<empty>" |
               .name = $generated_name |
               ._modified = true
             else
@@ -1016,7 +1360,7 @@ op_fix_names() {
 
     printf "\n" >&2
     log_info "Vault size: $total_items items"
-    log_info "Items with generic/missing names: ${BOLD}$modified_count${RESET}"
+    log_info "Items without a name: ${BOLD}$modified_count${RESET}"
 
     if [[ "$modified_count" -gt 0 ]]; then
         printf "\n${BOLD}%-36s │ %-30s ➔ %-35s${RESET}\n" "ITEM ID" "CURRENT NAME" "PROPOSED DESCRIPTIVE NAME"
@@ -1028,50 +1372,18 @@ op_fix_names() {
     fi
 
     if [[ "$modified_count" -eq 0 ]]; then
-        log_success "All entries already have descriptive names. Nothing to do."
+        log_success "All entries already have a name. Nothing to do."
         return 0
     fi
 
-    local effective_mode="$MODE"
-    if [[ "$INTERACTIVE" == true ]]; then
-        if prompt_confirmation "Rename $modified_count item(s)"; then
-            effective_mode="apply"
-        else
-            return 0
-        fi
-    fi
-
-    if [[ "$effective_mode" == "preview" ]]; then
-        printf "\n" >&2
-        log_warn "[DRY-RUN] No names modified. Run with -i or --apply to execute."
-    elif [[ "$EXEC_TARGET" == "mock" ]]; then
-        echo "$transformed_json" | jq 'map(del(._modified, ._old_name))' > "$MOCK_BW_DIR/items.json"
-        log_success "[MOCK BW] $modified_count name(s) updated in $MOCK_BW_DIR/items.json."
-    elif [[ -n "$OUTPUT_FILE" ]]; then
-        echo "$transformed_json" | jq 'map(del(._modified, ._old_name))' > "$OUTPUT_FILE"
-        log_success "$modified_count renamed item(s) saved to: $OUTPUT_FILE"
-    else
-        log_info "Sending name changes to Bitwarden CLI..."
-        local items_to_update
-        items_to_update=$(echo "$transformed_json" | jq -c '.[] | select(._modified == true) | del(._modified, ._old_name)')
-        local curr=0 ok_count=0 fail_count_upd=0 item_json
-        while IFS= read -r -u 3 item_json; do
-            [[ -z "$item_json" ]] && continue
-            curr=$((curr + 1))
-            render_progress "$curr" "$modified_count" "Updating items"
-            if bw_update_item "$item_json"; then
-                ok_count=$((ok_count + 1))
-            else
-                fail_count_upd=$((fail_count_upd + 1))
-            fi
-        done 3<<< "$items_to_update"
-        if [[ $fail_count_upd -eq 0 ]]; then
-            log_success "$ok_count item(s) successfully updated."
-        else
-            log_warn "$ok_count item(s) updated, $fail_count_upd failed."
-            return 1
-        fi
-    fi
+    apply_modified_items_plan \
+        "$raw_json" \
+        "$transformed_json" \
+        "$modified_count" \
+        "print_verbose_name_diff_card" \
+        "Rename $modified_count item(s)" \
+        "Apply generated name" \
+        "name(s)"
 }
 
 # --- DUPLICATE DETECTION ENGINES ---
@@ -1183,18 +1495,25 @@ compute_merge_plan() {
             name: $canonical.name,
             username: $canonical.login.username,
             skip_deletion: true,
+            conflict_items: $sorted,
             redundant_ids_to_delete: [],
             reason: "Multiple items hold independent FIDO2 Passkeys"
           }
         else
-          ($redundants | map(.notes // "") | join("\n---\n")) as $extra_notes |
-          ([$redundants[].fields[]?] // []) as $extra_fields |
-          ([$redundants[].login.uris[]?] // []) as $extra_uris |
+          ($redundants | map(.notes // "") | map(select(. != "" and . != ($canonical.notes // ""))) | unique | join("\n---\n")) as $extra_notes |
+          ([ $redundants[].fields[]? | select(.name as $n | (($canonical.fields // []) | map(.name) | index($n)) == null) ] | unique_by(.name)) as $new_fields |
+          ([ $redundants[].login.uris[]? | select(.uri as $u | (($canonical.login.uris // []) | map(.uri) | index($u)) == null) ] | unique_by(.uri)) as $new_uris |
 
           ($canonical |
-            .notes = (if (.notes // "") == "" then $extra_notes else (.notes + (if $extra_notes == "" then "" else "\n---\n" + $extra_notes end)) end) |
-            .fields = ((.fields // []) + $extra_fields | unique_by(.name)) |
-            .login.uris = ((.login.uris // []) + $extra_uris | unique_by(.uri))
+            if $extra_notes != "" then
+              .notes = (if (.notes // "") == "" then $extra_notes else (.notes + "\n---\n" + $extra_notes) end)
+            else . end |
+            if ($new_fields | length) > 0 then
+              .fields = ((.fields // []) + $new_fields)
+            else . end |
+            if ($new_uris | length) > 0 then
+              .login.uris = ((.login.uris // []) + $new_uris)
+            else . end
           ) as $merged_item |
 
           {
@@ -1202,6 +1521,12 @@ compute_merge_plan() {
             canonical_id: $canonical.id,
             name: $canonical.name,
             username: $canonical.login.username,
+            canonical_changed: ($merged_item != $canonical),
+            original_canonical: $canonical,
+            added_notes: $extra_notes,
+            added_fields: $new_fields,
+            added_uris: ($new_uris | map(.uri)),
+            redundant_items: $redundants,
             redundant_ids_to_delete: ($redundants | map(.id)),
             merged_item: $merged_item
           }
@@ -1271,7 +1596,60 @@ print_merge_plan_table() {
     fi
 }
 
+print_merge_plan_verbose_cards() {
+    local merge_result="$1"
+    local total_all curr=0 entry_json
+    total_all=$(echo "$merge_result" | jq 'length')
+    local all_entries
+    all_entries=$(echo "$merge_result" | jq -c '.[]')
+    while IFS= read -r -u 3 entry_json; do
+        [[ -z "$entry_json" ]] && continue
+        curr=$((curr + 1))
+        print_verbose_merge_cluster_card "$curr" "$total_all" "$entry_json"
+    done 3<<< "$all_entries"
+}
+
+# Single-cluster merge & deletion executor (used identically for 1 cluster or all clusters)
+execute_single_merge_cluster() {
+    local entry_json="$1"
+    local canonical_changed canonical_id cname can_ok=true
+    canonical_changed=$(printf '%s\n' "$entry_json" | jq -r '.canonical_changed')
+    canonical_id=$(printf '%s\n' "$entry_json" | jq -r '.canonical_id')
+    cname=$(printf '%s\n' "$entry_json" | jq -r '.name // .canonical_id')
+
+    CLUSTER_DEL_OK=0
+    CLUSTER_DEL_FAIL=0
+
+    if [[ "$canonical_changed" == "true" ]]; then
+        local merged_item_json
+        merged_item_json=$(printf '%s\n' "$entry_json" | jq -c '.merged_item')
+        if ! bw_update_item "$merged_item_json"; then
+            can_ok=false
+            log_warn "Skipping deletion of duplicates for '$cname' because canonical update failed."
+        fi
+    elif [[ "$VERBOSE" == true ]]; then
+        log_info "[VERBOSE] Canonical item $canonical_id ('$cname') already holds all attributes — no edit required."
+    fi
+
+    if [[ "$can_ok" == true ]]; then
+        local del_id
+        while IFS= read -r del_id; do
+            [[ -z "$del_id" ]] && continue
+            if bw_delete_single_item "$del_id" "$cname"; then
+                CLUSTER_DEL_OK=$((CLUSTER_DEL_OK + 1))
+            else
+                CLUSTER_DEL_FAIL=$((CLUSTER_DEL_FAIL + 1))
+            fi
+        done < <(printf '%s\n' "$entry_json" | jq -r '.redundant_ids_to_delete[]?')
+    else
+        CLUSTER_DEL_FAIL=$(printf '%s\n' "$entry_json" | jq '.redundant_ids_to_delete | length')
+    fi
+
+    [[ $CLUSTER_DEL_FAIL -eq 0 ]]
+}
+
 # --- OPERATION: Execute Merge Plan ---
+# Changing one cluster vs changing all runs the exact same per-cluster execution loop.
 execute_merge_plan() {
     local raw_json="$1"
     local merge_result="$2"
@@ -1280,96 +1658,118 @@ execute_merge_plan() {
     print_merge_plan_table "$merge_result"
     printf "\n${YELLOW}Planned cleanup scope:${RESET} %d redundant item(s) to be removed (Passkeys strictly protected).\n" "$total_deletions"
 
+    if [[ "$VERBOSE" == true ]]; then
+        local conflict_entries conflict_total c_idx=0 c_json
+        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")')
+        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")] | length')
+        if [[ "$conflict_total" -gt 0 ]]; then
+            while IFS= read -r -u 3 c_json; do
+                [[ -z "$c_json" ]] && continue
+                c_idx=$((c_idx + 1))
+                print_verbose_merge_cluster_card "$c_idx" "$conflict_total" "$c_json"
+            done 3<<< "$conflict_entries"
+        fi
+    fi
+
     if [[ "$total_deletions" -eq 0 ]]; then
         log_success "No redundant items eligible for deletion."
         return 0
     fi
 
-    local effective_mode="$MODE"
+    local preview_only=false
+    local ask_each=false
     if [[ "$INTERACTIVE" == true ]]; then
-        if prompt_confirmation "Deletion of $total_deletions redundant duplicate(s)"; then
-            effective_mode="apply"
+        if [[ "$VERBOSE" == true ]]; then
+            ask_each=true
         else
-            return 0
+            if ! prompt_confirmation "Deletion of $total_deletions redundant duplicate(s)"; then
+                return 0
+            fi
         fi
+    elif [[ "$MODE" == "preview" ]]; then
+        preview_only=true
     fi
 
-    if [[ "$effective_mode" == "preview" ]]; then
+    if [[ "$preview_only" != true && "$EXEC_TARGET" == "file" && -z "$OUTPUT_FILE" ]]; then
+        log_error "Input '--file' mode is read-only. Re-run with '--output <file>' to save cleaned data."
+        return 1
+    fi
+
+    if [[ "$preview_only" == true && "$VERBOSE" != true ]]; then
         printf "\n" >&2
         log_warn "[DRY-RUN] No items deleted. Run with -i or --apply to execute."
-    elif [[ "$effective_mode" == "apply" ]]; then
-        if [[ "$EXEC_TARGET" == "mock" ]]; then
-            local merged_json
-            merged_json=$(jq --argjson mr "$merge_result" '
-              ($mr | map(select(.status == "MERGED")) | INDEX(.canonical_id)) as $canonical_map |
-              ([$mr[].redundant_ids_to_delete[]?] | unique) as $del_ids |
-              map(
-                . as $item |
-                if ($del_ids | index($item.id)) != null then
-                  empty
-                elif $canonical_map[$item.id] != null then
-                  $canonical_map[$item.id].merged_item
-                else
-                  .
-                end
-              )
-            ' "$MOCK_BW_DIR/items.json")
-            echo "$merged_json" > "$MOCK_BW_DIR/items.json"
-            log_success "Cleanup completed: $total_deletions duplicate(s) successfully removed."
-        elif [[ -n "$OUTPUT_FILE" ]]; then
-            local merged_json
-            merged_json=$(echo "$raw_json" | jq --argjson mr "$merge_result" '
-              ($mr | map(select(.status == "MERGED")) | INDEX(.canonical_id)) as $canonical_map |
-              ([$mr[].redundant_ids_to_delete[]?] | unique) as $del_ids |
-              map(
-                . as $item |
-                if ($del_ids | index($item.id)) != null then
-                  empty
-                elif $canonical_map[$item.id] != null then
-                  $canonical_map[$item.id].merged_item
-                else
-                  .
-                end
-              )
-            ')
-            echo "$merged_json" > "$OUTPUT_FILE"
-            log_success "Cleaned vault data saved to: $OUTPUT_FILE"
-            log_success "Cleanup completed: $total_deletions duplicate(s) successfully removed."
-        elif [[ "$EXEC_TARGET" == "docker" || "$EXEC_TARGET" == "local" ]]; then
-            local merge_entries total_clusters curr_cluster=0 entry_json
-            merge_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "MERGED")')
-            total_clusters=$(echo "$merge_result" | jq '[.[] | select(.status == "MERGED")] | length')
-            local -a safe_delete_ids=()
-
-            while IFS= read -r -u 3 entry_json; do
-                [[ -z "$entry_json" ]] && continue
-                curr_cluster=$((curr_cluster + 1))
-                render_progress "$curr_cluster" "$total_clusters" "Updating canonical items"
-                local merged_item_json
-                merged_item_json=$(printf '%s\n' "$entry_json" | jq -c '.merged_item')
-                if bw_update_item "$merged_item_json"; then
-                    local del_id
-                    while IFS= read -r del_id; do
-                        [[ -n "$del_id" ]] && safe_delete_ids+=("$del_id")
-                    done < <(printf '%s\n' "$entry_json" | jq -r '.redundant_ids_to_delete[]?')
-                else
-                    local cname
-                    cname=$(printf '%s\n' "$entry_json" | jq -r '.name // .canonical_id')
-                    log_warn "Skipping deletion of duplicates for '$cname' because canonical update failed."
-                fi
-            done 3<<< "$merge_entries"
-
-            if [[ "${#safe_delete_ids[@]}" -eq 0 ]]; then
-                log_warn "No redundant items were deleted due to canonical update failures."
-                return 1
-            fi
-            if apply_deletions ${safe_delete_ids[@]+"${safe_delete_ids[@]}"}; then
-                log_success "Cleanup completed: ${#safe_delete_ids[@]} duplicate(s) successfully removed."
-            else
-                return 1
-            fi
-        fi
+        return 0
     fi
+
+    WORKING_VAULT_JSON="$raw_json"
+    local merge_entries total_clusters curr_cluster=0 entry_json
+    local deleted_ok=0 deleted_fail=0 skipped_clusters=0 applied_clusters=0
+    local CLUSTER_DEL_OK=0 CLUSTER_DEL_FAIL=0
+    merge_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "MERGED")')
+    total_clusters=$(echo "$merge_result" | jq '[.[] | select(.status == "MERGED")] | length')
+
+    while IFS= read -r -u 3 entry_json; do
+        [[ -z "$entry_json" ]] && continue
+        curr_cluster=$((curr_cluster + 1))
+
+        if [[ "$VERBOSE" == true ]]; then
+            print_verbose_merge_cluster_card "$curr_cluster" "$total_clusters" "$entry_json"
+        else
+            render_progress "$curr_cluster" "$total_clusters" "Merging clusters"
+        fi
+
+        [[ "$preview_only" == true ]] && continue
+
+        local cluster_del_count
+        cluster_del_count=$(printf '%s\n' "$entry_json" | jq '.redundant_ids_to_delete | length')
+
+        if [[ "$ask_each" == true ]]; then
+            prompt_verbose_item_decision "Execute cluster [$curr_cluster/$total_clusters] (delete $cluster_del_count duplicate(s))?"
+            case "$VERBOSE_DECISION" in
+                no)
+                    skipped_clusters=$((skipped_clusters + 1))
+                    log_info "Skipped cluster [$curr_cluster/$total_clusters]."
+                    continue
+                    ;;
+                quit)
+                    local rem=$((total_clusters - curr_cluster + 1))
+                    log_warn "Cancelled remaining $rem cluster(s)."
+                    break
+                    ;;
+                all)
+                    ask_each=false
+                    ;;
+            esac
+        fi
+
+        execute_single_merge_cluster "$entry_json" || true
+        applied_clusters=$((applied_clusters + 1))
+        deleted_ok=$((deleted_ok + CLUSTER_DEL_OK))
+        deleted_fail=$((deleted_fail + CLUSTER_DEL_FAIL))
+    done 3<<< "$merge_entries"
+
+    if [[ "$preview_only" == true ]]; then
+        printf "\n" >&2
+        log_warn "[DRY-RUN] No items deleted. Run with -i or --apply to execute."
+        return 0
+    fi
+
+    local skip_note=""
+    [[ $skipped_clusters -gt 0 ]] && skip_note=" ($skipped_clusters cluster(s) skipped)"
+
+    if [[ -n "$OUTPUT_FILE" && $applied_clusters -gt 0 ]]; then
+        log_success "Cleaned vault data saved to: $OUTPUT_FILE"
+    fi
+
+    if [[ $deleted_ok -eq 0 && $deleted_fail -eq 0 ]]; then
+        log_warn "No duplicate clusters were applied${skip_note}."
+    elif [[ $deleted_fail -eq 0 ]]; then
+        log_success "Cleanup completed: $deleted_ok duplicate(s) deleted${skip_note}."
+    else
+        log_warn "Cleanup completed with errors: $deleted_ok duplicate(s) deleted, $deleted_fail skipped/failed${skip_note}."
+        return 1
+    fi
+    return 0
 }
 
 # --- OPERATION: Find Duplicates Across Multi-Tier (CLI entry) ---
@@ -1488,14 +1888,18 @@ op_duplicate_workflow() {
 
     # Interactive action prompt based on analysis findings
     while true; do
+        local v_label="${DIM}OFF${RESET}"
+        [[ "$VERBOSE" == true ]] && v_label="${GREEN}ON${RESET}"
+
         printf "${BOLD}Duplicate Resolution Menu:${RESET}\n" >&2
         printf "  [1] Safe Merge & Cleanup (%d redundant item(s) to delete)\n" "$total_deletions" >&2
         printf "  [2] View Tier 1 details (Exact duplicates: %d cluster(s))\n" "$exact_clusters" >&2
         printf "  [3] View Tier 2 details (Content-identical: %d cluster(s))\n" "$content_clusters" >&2
         printf "  [4] View Tier 3 details (Partial matches: %d cluster(s))\n" "$partial_clusters" >&2
-        printf "  [5] Preview complete merge & deletion plan table\n" >&2
+        printf "  [5] Preview complete merge & deletion plan\n" >&2
+        printf "  [v] Toggle verbose mode (currently: %s)\n" "$v_label" >&2
         printf "  [b] Back to main menu\n\n" >&2
-        printf "Selection [1-5, b]: " >&2
+        printf "Selection [1-5, v, b]: " >&2
 
         local subchoice=""
         read_tty_line subchoice
@@ -1521,6 +1925,18 @@ op_duplicate_workflow() {
                 ;;
             5)
                 print_merge_plan_table "$merge_result"
+                if [[ "$VERBOSE" == true ]]; then
+                    print_merge_plan_verbose_cards "$merge_result"
+                fi
+                ;;
+            v|V)
+                if [[ "$VERBOSE" == true ]]; then
+                    VERBOSE=false
+                    log_info "Verbose mode disabled."
+                else
+                    VERBOSE=true
+                    log_success "Verbose mode enabled (per-item diffs & step-by-step confirmation)."
+                fi
                 ;;
             b|B)
                 break
@@ -1536,12 +1952,19 @@ op_duplicate_workflow() {
 # --- INTERACTIVE WIZARD MENU ---
 run_interactive_wizard() {
     INTERACTIVE=true
+    local raw_json=""
+    local needs_refresh=true
 
     while true; do
-        local raw_json
-        if ! raw_json="$(fetch_vault_json)"; then
-            exit 1
+        if [[ "$needs_refresh" == true ]]; then
+            if ! raw_json="$(fetch_vault_json)"; then
+                exit 1
+            fi
+            needs_refresh=false
         fi
+
+        local v_label="${DIM}OFF${RESET}"
+        [[ "$VERBOSE" == true ]] && v_label="${GREEN}ON${RESET}"
 
         printf "\n${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${RESET}\n"
         printf "${BOLD}${CYAN}║     VAULTWARDEN & BITWARDEN MAINTENANCE WIZARD                       ║${RESET}\n"
@@ -1550,16 +1973,17 @@ run_interactive_wizard() {
             printf " ${DIM}Connected: %s (%s)${RESET}\n\n" "$EXEC_TARGET" "$CONNECTED_ACCOUNT"
         fi
         printf " [1] Fix KeePass URLs (migrate URLs from notes/fields into URI matches)\n"
-        printf " [2] Fix missing / generic names (restore 'Domain (Username)')\n"
+        printf " [2] Fix missing names (set 'Domain (Username)' for unnamed entries)\n"
         printf " [3] Analyze & resolve duplicates (smart multi-tier audit & merge)\n"
+        printf " [v] Toggle verbose mode (currently: %s)\n" "$v_label"
         if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
             printf " [l] Logout Bitwarden CLI session\n"
         fi
         printf " [q] Quit\n\n"
         if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
-            printf "Selection [1-3, l, q]: "
+            printf "Selection [1-3, v, l, q]: "
         else
-            printf "Selection [1-3, q]: "
+            printf "Selection [1-3, v, q]: "
         fi
 
         local menu_choice=""
@@ -1567,9 +1991,27 @@ run_interactive_wizard() {
         menu_choice="${menu_choice:-q}"
 
         case "$menu_choice" in
-            1) op_fix_uris "$raw_json" || true ;;
-            2) op_fix_names "$raw_json" || true ;;
-            3) op_duplicate_workflow "$raw_json" || true ;;
+            1)
+                op_fix_uris "$raw_json" || true
+                needs_refresh=true
+                ;;
+            2)
+                op_fix_names "$raw_json" || true
+                needs_refresh=true
+                ;;
+            3)
+                op_duplicate_workflow "$raw_json" || true
+                needs_refresh=true
+                ;;
+            v|V)
+                if [[ "$VERBOSE" == true ]]; then
+                    VERBOSE=false
+                    log_info "Verbose mode disabled."
+                else
+                    VERBOSE=true
+                    log_success "Verbose mode enabled (per-item diffs & step-by-step confirmation)."
+                fi
+                ;;
             l|L)
                 if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
                     run_bw_capture logout --nointeraction || true
@@ -1589,10 +2031,6 @@ run_interactive_wizard() {
                 log_error "Invalid selection: $menu_choice"
                 ;;
         esac
-
-        printf "\nPress Enter for main menu..."
-        local _pause=""
-        read_tty_line _pause
     done
 }
 
@@ -1607,6 +2045,10 @@ main() {
         case "$1" in
             -i|--interactive)
                 INTERACTIVE=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
                 shift
                 ;;
             --server)
@@ -1692,7 +2134,7 @@ main() {
         fi
     fi
 
-    log_info "Initializing [Target: ${BOLD}$EXEC_TARGET${RESET}, Mode: ${BOLD}$MODE${RESET}, Interactive: ${BOLD}$INTERACTIVE${RESET}]"
+    log_info "Initializing [Target: ${BOLD}$EXEC_TARGET${RESET}, Mode: ${BOLD}$MODE${RESET}, Interactive: ${BOLD}$INTERACTIVE${RESET}, Verbose: ${BOLD}$VERBOSE${RESET}]"
     prepare_target_environment
 
     if [[ "$INTERACTIVE" == true && -z "$command" ]]; then

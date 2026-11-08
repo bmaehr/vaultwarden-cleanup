@@ -66,10 +66,11 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# --- 2. Descriptive Names Tests ---
+# --- 2. Missing Names Tests ---
 out2=$("$BIN" --file "$SCRIPT_DIR/fixture_generic_names.json" fix-names 2>&1)
-assert_contains "$out2" "login.microsoftonline.com (b.maehr@mvb-online.de)" "2.1: Replaces raw URL with 'Domain (user)'"
+assert_not_contains "$out2" "login.microsoftonline.com (b.maehr@mvb-online.de)" "2.1: Preserves entries that already have a URL/non-empty name"
 assert_contains "$out2" "pve-cluster.lan (admin)" "2.2: Generates title from empty name using host & user"
+assert_contains "$out2" "nas.home.lan (backup)" "2.2b: Generates title from null name using host & user"
 
 cp "$SCRIPT_DIR/fixture_generic_names.json" "$SCRIPT_DIR/mock_vault/items.json"
 out2_apply=$("$BIN" --mock-bw "$SCRIPT_DIR/mock_vault" --apply fix-names 2>&1)
@@ -152,14 +153,14 @@ assert_contains "$out_unauth" "status: unauthenticated" "10.2: Detects ./.bin/bw
 # 10.3: Interactive server config + login + sync + multi-item update via ./.bin/bw
 rm -f "$MOCK_STATE_JSON"
 cp "$SCRIPT_DIR/fixture_generic_names.json" "$MOCK_LIVE_ITEMS"
-# Inputs: server URL -> method 1 -> email -> password -> menu 2 (fix-names) -> confirm 'y' -> Enter -> menu 'q'
-out_interactive_live=$(printf "vault.example.com\n1\nadmin@example.com\ncorrect-horse-battery\n2\ny\n\nq\n" | \
+# Inputs: server URL -> method 1 -> email -> password -> menu 2 (fix-names) -> confirm 'y' -> menu 'q'
+out_interactive_live=$(printf "vault.example.com\n1\nadmin@example.com\ncorrect-horse-battery\n2\ny\nq\n" | \
     PATH="/usr/bin:/bin" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" "$BIN" -i 2>&1)
 assert_contains "$out_interactive_live" "Configured server: https://vault.example.com" "10.3: Normalizes and configures Vaultwarden server URL"
 assert_contains "$out_interactive_live" "Vault synchronized" "10.4: Authenticates, unlocks, and synchronizes vault"
 assert_contains "$out_interactive_live" "2 item(s) successfully updated" "10.5: Updates all modified items via CLI loop without stdin loss"
 
-live_renamed_count=$(jq '[.[] | select(.name == "login.microsoftonline.com (b.maehr@mvb-online.de)" or .name == "pve-cluster.lan (admin)")] | length' "$MOCK_LIVE_ITEMS")
+live_renamed_count=$(jq '[.[] | select(.name == "pve-cluster.lan (admin)" or .name == "nas.home.lan (backup)")] | length' "$MOCK_LIVE_ITEMS")
 if [[ "$live_renamed_count" -eq 2 ]]; then
     printf "${GREEN}[PASS]${NC} 10.6: Both renamed items persisted via simulated 'bw encode' + 'bw edit'\n"
     pass_count=$((pass_count + 1))
@@ -171,9 +172,9 @@ fi
 # 10.7: Canonical update failure prevents deleting redundant duplicates (Data Loss Armor)
 cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
 orig_dup_len=$(jq 'length' "$MOCK_LIVE_ITEMS")
-out_fail_edit=$(PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" MOCK_BW_FAIL_EDIT_ID="aaaa1111-0000-0000-0000-000000000001" "$BIN" --apply merge-duplicates 2>&1 || true)
+out_fail_edit=$(PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" MOCK_BW_FAIL_EDIT_ID="dddd4444-0000-0000-0000-000000000001" "$BIN" --apply merge-duplicates 2>&1 || true)
 assert_contains "$out_fail_edit" "Skipping deletion of duplicates" "10.7: Skips deleting duplicates when canonical update fails"
-surviving_dup=$(jq '[.[] | select(.id == "aaaa1111-0000-0000-0000-000000000002")] | length' "$MOCK_LIVE_ITEMS")
+surviving_dup=$(jq '[.[] | select(.id == "dddd4444-0000-0000-0000-000000000002")] | length' "$MOCK_LIVE_ITEMS")
 if [[ "$surviving_dup" -eq 1 ]]; then
     printf "${GREEN}[PASS]${NC} 10.8: Redundant item preserved when canonical edit failed\n"
     pass_count=$((pass_count + 1))
@@ -212,6 +213,65 @@ out_vw_switch=$(printf "\n\nq\n" | \
     PATH="$TMP_TEST_DIR:/usr/bin:/bin" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="$MOCK_STATE_JSON" "$BIN" --interactive --docker 7a14e94830e4 2>&1)
 assert_contains "$out_vw_switch" "does not contain the Bitwarden CLI" "10.9: Detects vaultwarden/server container lacking 'bw' and offers local fallback"
 assert_contains "$out_vw_switch" "Configured server: https://vw.internal.lan" "10.10: Auto-detects DOMAIN from Vaultwarden container as default server URL"
+
+# --- 8. Verbose Mode Diffs, Secret Masking & Per-Item Confirmation ---
+# 11.1 & 11.2: Dry-run verbose diff card shows full metadata + URI diff while masking passwords
+out_v_uris=$("$BIN" -v --file "$SCRIPT_DIR/fixture_keepass_uris.json" fix-uris 2>&1)
+assert_contains "$out_v_uris" "UPDATE ITEM: Migrate KeePass Web Match URIs" "11.1: Verbose dry-run renders detailed per-item diff card"
+assert_contains "$out_v_uris" "+ Added URI:    https://internal.company.net/login" "11.2a: Verbose card lists individual added URIs"
+assert_contains "$out_v_uris" "********" "11.2b: Verbose card masks sensitive password field"
+assert_not_contains "$out_v_uris" "SecretPassword123!" "11.2c: Verbose card never leaks plaintext password"
+
+# 11.3 & 11.4: Interactive verbose mode allows per-item [y/n/a/q] selective application
+cp "$SCRIPT_DIR/fixture_generic_names.json" "$SCRIPT_DIR/mock_vault/items.json"
+# Inputs: 'v' (toggle verbose ON) -> '2' (fix-names) -> 'y' (apply [1/2]) -> 'n' (skip [2/2]) -> 'q' (quit wizard)
+out_v_names=$(printf "v\n2\ny\nn\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_vault" 2>&1)
+assert_contains "$out_v_names" "1 name(s) updated" "11.3: Interactive verbose mode applies approved item and skips declined item"
+assert_contains "$out_v_names" "(1 skipped)" "11.3b: Reports exact skipped item count"
+v_name_first=$(jq -r '.[] | select(.id == "44444444-4444-4444-4444-444444444444") | .name' "$SCRIPT_DIR/mock_vault/items.json")
+v_name_second=$(jq -r '.[] | select(.id == "66666666-6666-6666-6666-666666666666") | .name' "$SCRIPT_DIR/mock_vault/items.json")
+if [[ "$v_name_first" == "pve-cluster.lan (admin)" && "$v_name_second" == "null" ]]; then
+    printf "${GREEN}[PASS]${NC} 11.4: Selective per-item [y/n] persisted only the approved item\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 11.4: Unexpected names after selective apply: first='%s', second='%s'\n" "$v_name_first" "$v_name_second"
+    fail_count=$((fail_count + 1))
+fi
+
+# 11.5: Interactive verbose duplicate merge supports per-cluster confirmation and early cancel ('q')
+cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
+# Cluster 1 (app.teamgantt.com): 'y' -> deletes 1 duplicate; Cluster 2: 'q' -> cancels remaining clusters
+out_v_merge=$(printf "1\ny\nq\n" | \
+    PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" -i -v duplicates 2>&1)
+assert_contains "$out_v_merge" "MERGE & DELETE DUPLICATE(S)" "11.5a: Verbose duplicate resolution shows per-cluster before/after card"
+assert_contains "$out_v_merge" "1 duplicate(s) deleted" "11.5b: Per-cluster [y/q] applies first cluster and cancels remaining cleanly"
+
+# 11.6: Choosing 'a' (apply all remaining) executes remaining clusters without re-prompting via same code path
+cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
+out_v_all=$(printf "1\na\n" | \
+    PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" -i -v duplicates 2>&1)
+assert_contains "$out_v_all" "4 duplicate(s) deleted" "11.6a: Answering 'a' applies all remaining clusters without additional confirmation prompts"
+rem_v_all=$(jq 'length' "$MOCK_LIVE_ITEMS")
+if [[ "$rem_v_all" -eq 4 ]]; then
+    printf "${GREEN}[PASS]${NC} 11.6b: All 4 duplicate clusters resolved cleanly via unified loop (4 canonical items left)\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 11.6b: Expected 4 remaining items after 'a', found %d\n" "$rem_v_all"
+    fail_count=$((fail_count + 1))
+fi
+
+# 11.7: Non-interactive -v --apply with --file and --output uses the exact same per-cluster code path
+out_file_merge="$TMP_TEST_DIR/merged_out.json"
+out_file_res=$("$BIN" -v --file "$SCRIPT_DIR/fixture_duplicates.json" --output "$out_file_merge" --apply merge-duplicates 2>&1)
+assert_contains "$out_file_res" "4 duplicate(s) deleted" "11.7a: Headless -v --apply --output applies all clusters cleanly"
+out_merged_fields=$(jq '[.[] | select(.id == "dddd4444-0000-0000-0000-000000000001") | .fields[]?.name] | sort | join(",")' -r "$out_file_merge")
+if [[ "$out_merged_fields" == "ImapHost,ServerPort" ]]; then
+    printf "${GREEN}[PASS]${NC} 11.7b: Merged canonical attributes and deletions persisted to --output file\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 11.7b: Expected merged fields 'ImapHost,ServerPort', found '%s'\n" "$out_merged_fields"
+    fail_count=$((fail_count + 1))
+fi
 
 if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
     rm -rf "$PARENT_DIR/.bin"

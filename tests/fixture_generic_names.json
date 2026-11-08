@@ -42,5 +42,20 @@
         }
       ]
     }
+  },
+  {
+    "id": "66666666-6666-6666-6666-666666666666",
+    "type": 1,
+    "name": null,
+    "login": {
+      "username": "backup",
+      "password": "NasPassword!",
+      "uris": [
+        {
+          "uri": "https://nas.home.lan:5001",
+          "match": 0
+        }
+      ]
+    }
   }
 ]

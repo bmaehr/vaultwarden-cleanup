@@ -14,6 +14,8 @@ Launch the interactive wizard against an exported JSON file or directly with you
 # Live against your Vaultwarden server (auto-downloads standalone './.bin/bw' if missing,
 # guides through server URL, login/2FA/API key, unlock, and vault sync)
 ./vault_manager.sh -i
+# or with Verbose Mode enabled for per-item before/after diffs and [y/n/a/q] step-by-step confirmation:
+./vault_manager.sh -i -v
 # or specify the server URL up front:
 ./vault_manager.sh -i --server https://vault.example.com
 
@@ -35,8 +37,10 @@ export BW_SESSION="your_session_key"
 ### Interactive Workflow:
 1. **Main Menu:**
    - `[1]` Fix KeePass URLs (migrate URLs from notes/fields into URI matches)
-   - `[2]` Fix missing / generic names (restore 'Domain (Username)')
+   - `[2]` Fix missing names (set 'Domain (Username)' for unnamed entries)
    - `[3]` Analyze & resolve duplicates (smart multi-tier audit & passkey-protected merge)
+   - `[v]` Toggle verbose mode (per-item before/after diff cards + `[y/n/a/q]` confirmation)
+   - `[l]` Logout Bitwarden CLI session (when connected to a live CLI target)
    - `[q]` Quit
 2. **Smart Duplicate Analysis & Resolution (Option 3):**
    - Automatically executes a multi-tier scan across:
@@ -49,16 +53,17 @@ export BW_SESSION="your_session_key"
      - `[1]` Safe Merge & Cleanup (consolidate fields, delete redundant items)
      - `[2]` View Tier 1 details
      - `[3]` View Tier 2 details
-     - `[4] `View Tier 3 details
-     - `[5]` Preview complete merge & deletion plan table
+     - `[4]` View Tier 3 details
+     - `[5]` Preview complete merge & deletion plan (includes full cluster diff cards when verbose is `ON`)
+     - `[v]` Toggle verbose mode
      - `[b]` Back to main menu
-3. **Explicit Confirmation Prompt:**
-   ```text
-   Action required:
-     Do you want to execute the planned operation Deletion of 4 redundant duplicate(s) now?
-     [y/N] (Default: No, Cancel):
-   ```
-   Changes and deletions are only executed after explicit confirmation (`y`).
+3. **Explicit Confirmation Prompts:**
+   - **Standard Mode:** Prompts once before applying the batch (`[y/N]`).
+   - **Verbose Mode (`-v` / `--verbose` or `[v]` in menus):** Displays an individual before/after diff card for every modified item or duplicate cluster (with passwords, TOTP secrets, and hidden custom fields masked as `********`), followed by a per-item decision prompt:
+     - `[y]` Apply this item/cluster
+     - `[n]` Skip this item/cluster (Default)
+     - `[a]` Apply this and all remaining items/clusters without further prompts
+     - `[q]` Cancel remaining items/clusters
 
 ---
 
@@ -71,8 +76,8 @@ export BW_SESSION="your_session_key"
 # 2. Inspect duplicates by strictness tier
 ./vault_manager.sh --file export.json find-duplicates --tier content
 
-# 3. Dry-run preview of merge plan
-./vault_manager.sh --file export.json merge-duplicates
+# 3. Dry-run preview of merge plan (add -v for full per-cluster before/after diff cards)
+./vault_manager.sh -v --file export.json merge-duplicates
 
 # 4. Migrate KeePass URIs and write to clean file
 ./vault_manager.sh --file export.json fix-uris --output clean_vault.json
