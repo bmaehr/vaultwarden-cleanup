@@ -11,9 +11,9 @@
 #   5. Smart Name Restoration: Reconstructs titles as 'Domain (Username)'.
 #   6. Multi-tier Duplicate Detection:
 #        - exact: Strict comparison of all attributes. Timestamps must match.
-#        - content: Payload comparison (Name, User, Password, URIs, Notes, Fields).
-#        - partial: Merge candidates (matching domain + username, divergent fields).
-#   7. Passkey Armor: Never proposes or executes deletions for fido2Credentials.
+#        - content: Payload comparison (Name, User, Password, TOTP, URIs, Notes, Fields, Passkeys).
+#        - partial: Audit view (same main domain + username + passkey status, incl. merge eligibility).
+#   7. Passkey & TOTP Armor: Never merges/deletes differing passkeys or differing 2FA TOTP secrets.
 #   8. Real-time Progress Bar & ANSI box-drawing tables.
 #
 # Requirements: bash (>=4.0), jq
@@ -279,7 +279,7 @@ ${BOLD}Commands:${RESET}
   ${CYAN}find-duplicates${RESET}      Locate duplicate items across multiple strictness tiers:
                          --tier exact    : Strict. Timestamps (creation/revision) must match.
                          --tier content  : Payload match. Ignores timestamps and IDs.
-                         --tier partial  : Identifies merge candidates (same domain & user, differing fields).
+                         --tier partial  : Audit view (same main domain & username; shows whether mergeable or audit-only).
   ${CYAN}merge-duplicates${RESET}     Consolidate fields into canonical item and prepare safe deletion list
   ${CYAN}duplicates${RESET}           Combined duplicate workflow: full audit, tier breakdown & resolution
   ${CYAN}test-run${RESET}             Execute offline simulation test suite
@@ -1235,6 +1235,8 @@ print_verbose_merge_cluster_card() {
         if (item.login.fido2Credentials // [] | length) > 0 then
           "🔒 \(item.login.fido2Credentials | length) passkey(s) protected"
         else "<none>" end;
+      def fmt_totp(item):
+        if (item.login.totp // "") != "" then "******** (configured)" else "<none>" end;
       def fmt_notes(n; pad):
         if (n // "") == "" then "<empty>"
         else (n | split("\n") | join("\n" + pad))
@@ -1247,6 +1249,13 @@ print_verbose_merge_cluster_card() {
           ($yellow + "│" + $reset + " 🔒 Protected ID: " + $bold + (.id // "no-id") + $reset + " | Name: " + (.name // "<empty>") + " | User: " + (.login.username // "<empty>") + " | " + fmt_pk(.))
         ),
         ($yellow + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
+      elif .status == "CONFLICT_MULTIPLE_TOTP" then
+        ($yellow + "┌─ [Conflict " + $idx + "/" + $total + "] " + $bold + "SKIPPED — DIFFERENT 2FA/TOTP SECRETS PROTECTED" + $reset + $yellow + " ───────────" + $reset),
+        ($yellow + "│" + $reset + " Reason:    " + (.reason // "Multiple different 2FA TOTP secrets")),
+        ((.conflict_items // [])[] |
+          ($yellow + "│" + $reset + " 🔒 Protected ID: " + $bold + (.id // "no-id") + $reset + " | Name: " + (.name // "<empty>") + " | User: " + (.login.username // "<empty>") + " | TOTP: " + fmt_totp(.))
+        ),
+        ($yellow + "└──────────────────────────────────────────────────────────────────────────────" + $reset)
       else
         .original_canonical as $orig |
         .merged_item as $merged |
@@ -1256,10 +1265,14 @@ print_verbose_merge_cluster_card() {
         ($cyan + "│" + $reset + "   Name:      " + ($orig.name // "<empty>")),
         ($cyan + "│" + $reset + "   Username:  " + ($orig.login.username // "<empty>")),
         ($cyan + "│" + $reset + "   Password:  " + mask_pw($orig.login.password)),
+        ($cyan + "│" + $reset + "   TOTP:      " + fmt_totp($orig)),
         ($cyan + "│" + $reset + "   Passkeys:  " + fmt_pk($orig)),
         ($cyan + "│" + $reset + "   Dates:     Created " + ($orig.creationDate // "N/A") + " | Revised " + ($orig.revisionDate // "N/A")),
         (if .canonical_changed then
           ($cyan + "│" + $reset + "   Action:    " + $yellow + "UPDATE CANONICAL ITEM (consolidating attributes from duplicate(s))" + $reset),
+          (if .added_totp then
+            ($cyan + "│" + $reset + "   " + $green + "+ Merged TOTP:    ******** (2FA secret preserved from duplicate)" + $reset)
+           else empty end),
           (if (.added_notes // "") != "" then
             ($cyan + "│" + $reset + "   " + $yellow + "- Notes (before): " + fmt_notes($orig.notes; $cyan + "│" + $reset + "                     ") + $reset),
             ($cyan + "│" + $reset + "   " + $green + "+ Notes (after):  " + fmt_notes($merged.notes; $cyan + "│" + $reset + "                     ") + $reset)
@@ -1502,6 +1515,86 @@ op_fix_names() {
 }
 
 # --- DUPLICATE DETECTION ENGINES ---
+read -r -d '' JQ_DOMAIN_PASSKEY_HELPERS << 'EOF' || true
+def has_passkey(item):
+  (item.login.fido2Credentials != null and (item.login.fido2Credentials | length) > 0);
+
+def norm_passkeys(fido):
+  ((fido // []) | sort_by(.credentialId // "", .rpId // "", .userHandle // ""));
+
+def extract_main_domain(uri):
+  if uri == null or uri == "" then ""
+  else
+    (uri | ascii_downcase | gsub("^\\s+|\\s+$"; "")) as $u |
+    if ($u == "" or ($u | test("\\s"))) then ""
+    elif (($u | test("^[a-z][a-z0-9+.-]*://")) and (($u | test("^https?://")) | not)) then ""
+    else
+      ($u | sub("^https?://"; "") | split("/")[0] | split("?")[0] | split("#")[0] | split("@")[-1]) as $authority |
+      (if ($authority | startswith("[")) then
+         ($authority | split("]")[0] | sub("^\\["; ""))
+       else
+         ($authority | split(":")[0])
+       end | sub("^\\.+"; "") | sub("\\.+$"; "")) as $host |
+      if ($host == "" or $host == "http" or $host == "https") then ""
+      elif (($host | test("^[0-9]+(\\.[0-9]+){3}$")) or ($host | contains(":"))) then
+        $host
+      elif ($host | split(".") | any(. == "")) then
+        ""
+      else
+        ($host | split(".")) as $parts |
+        ($parts | length) as $len |
+        if $len <= 2 then
+          $host
+        else
+          ($parts[-2] + "." + $parts[-1]) as $last2 |
+          if ([
+            "co.uk","org.uk","me.uk","ac.uk","gov.uk","net.uk","ltd.uk","plc.uk","sch.uk","nhs.uk","mod.uk",
+            "com.au","net.au","org.au","edu.au","gov.au","asn.au","id.au",
+            "co.nz","net.nz","org.nz","govt.nz","ac.nz","school.nz",
+            "co.jp","ne.jp","or.jp","ac.jp","ad.jp","ed.jp","go.jp","gr.jp","lg.jp",
+            "com.br","net.br","org.br","gov.br","edu.br",
+            "com.cn","net.cn","org.cn","gov.cn","edu.cn",
+            "com.tw","org.tw","net.tw","idv.tw",
+            "com.hk","org.hk","edu.hk","gov.hk",
+            "co.kr","or.kr","ne.kr","go.kr",
+            "co.za","org.za","gov.za",
+            "co.in","net.in","org.in","gov.in","ac.in",
+            "com.tr","net.tr","org.tr","gov.tr","bel.tr","k12.tr",
+            "com.mx","org.mx","gob.mx","edu.mx",
+            "com.ar","gov.ar","org.ar",
+            "co.il","org.il","ac.il","gov.il",
+            "co.at","or.at","gv.at","ac.at","priv.at",
+            "com.pl","net.pl","org.pl","gov.pl","edu.pl",
+            "com.es","nom.es","org.es","gob.es","edu.es",
+            "com.sg","org.sg","gov.sg","edu.sg",
+            "com.my","org.my","gov.my",
+            "co.id","or.id","go.id","web.id","sch.id","ac.id",
+            "com.ph","org.ph","gov.ph",
+            "co.th","or.th","in.th","ac.th","go.th",
+            "com.ua","org.ua","net.ua","gov.ua",
+            "co.ke","eu.org",
+            "com.co","org.co","net.co","gov.co","nom.co",
+            "qc.ca","on.ca","bc.ca","ab.ca",
+            "github.io","gitlab.io","bitbucket.io","pages.dev","workers.dev",
+            "herokuapp.com","appspot.com","azurewebsites.net","cloudfront.net",
+            "vercel.app","netlify.app","fly.dev","onrender.com","railway.app",
+            "ddns.net","duckdns.org","dyndns.org","no-ip.org",
+            "myfritz.net","synology.me","quickconnect.to"
+          ] | index($last2)) != null then
+            ($parts[-3:] | join("."))
+          else
+            ($parts[-2:] | join("."))
+          end
+        end
+      end
+    end
+  end;
+
+def item_main_domains(item):
+  [ item.login.uris[]? | (.uri // "") | extract_main_domain(.) | select(. != "") ]
+  | unique | sort;
+EOF
+
 compute_exact_duplicates() {
     local raw_json="$1"
     echo "$raw_json" | jq '
@@ -1524,29 +1617,31 @@ compute_exact_duplicates() {
 
 compute_content_duplicates() {
     local raw_json="$1"
-    echo "$raw_json" | jq '
-      def has_pk: (.login.fido2Credentials != null and (.login.fido2Credentials | length) > 0);
+    echo "$raw_json" | jq "${JQ_DOMAIN_PASSKEY_HELPERS}"'
       group_by({
         type: .type,
         name: .name,
         login: {
           username: .login.username,
           password: .login.password,
-          uris: (.login.uris // [] | map(.uri) | sort)
+          totp: (.login.totp // ""),
+          uris: (.login.uris // [] | map(.uri) | sort),
+          has_passkey: has_passkey(.),
+          passkeys: norm_passkeys(.login.fido2Credentials)
         },
         notes: .notes,
         fields: (.fields // [] | sort_by(.name))
       }) |
       map(select(length > 1)) |
       map(
-        sort_by(if has_pk then 0 else 1 end) |
+        sort_by(if has_passkey(.) then 0 else 1 end) |
         {
           count: length,
           canonical_id: .[0].id,
           name: .[0].name,
           username: .[0].login.username,
           duplicate_ids: (.[1:] | map(.id)),
-          passkey_items: [ .[] | select(.login.fido2Credentials != null and (.login.fido2Credentials | length) > 0) | .id ]
+          passkey_items: [ .[] | select(has_passkey(.)) | .id ]
         }
       )
     '
@@ -1554,54 +1649,75 @@ compute_content_duplicates() {
 
 compute_partial_duplicates() {
     local raw_json="$1"
-    echo "$raw_json" | jq '
-      def extract_domain(uri):
-        if uri == null or uri == "" then ""
-        else
-          (uri | sub("^https?://"; "") | sub("^www\\."; "") | split("/")[0] | split(":")[0])
-        end;
-
-      map(select(.type == 1)) |
+    echo "$raw_json" | jq "${JQ_DOMAIN_PASSKEY_HELPERS}"'
+      map(
+        select(.type == 1 and (.login.username // "") != "") |
+        . as $it |
+        (item_main_domains($it)) as $doms |
+        select(($doms | length) > 0)
+      ) |
       group_by({
-        user: (.login.username // "" | ascii_downcase),
-        dom: extract_domain(.login.uris[0].uri // "")
-      } | select(.user != "" and .dom != "")) |
+        user: (.login.username | ascii_downcase),
+        doms: item_main_domains(.),
+        has_passkey: has_passkey(.)
+      }) |
       map(select(length > 1)) |
-      map({
-        domain: (.[0].login.uris[0].uri // "" | sub("^https?://"; "") | split("/")[0]),
-        username: .[0].login.username,
-        item_count: length,
-        items: map({
-          id: .id,
-          name: .name,
-          has_pw: (.login.password != null and .login.password != ""),
-          has_passkey: (.login.fido2Credentials != null and (.login.fido2Credentials | length) > 0),
-          field_count: (.fields // [] | length),
-          has_notes: (.notes != null and .notes != "")
-        })
-      })
+      map(
+        (
+          [
+            (if (map(.login.username) | unique | length) > 1 then "diff username case" else empty end),
+            (if (map(.login.password // "") | unique | length) > 1 then "diff passwords" else empty end),
+            (if ([.[] | norm_passkeys(.login.fido2Credentials)] | unique | length) > 1 then "diff passkeys" else empty end),
+            (if ([.[] | (.login.totp // "") | select(. != "")] | unique | length) > 1 then "diff TOTP" else empty end)
+          ] | if length > 0 then "AUDIT ONLY: " + join(", ") else "MERGE CANDIDATE" end
+        ) as $merge_note |
+        {
+          domain: (item_main_domains(.[0]) | join(", ")),
+          username: .[0].login.username,
+          item_count: length,
+          merge_note: $merge_note,
+          items: map({
+            id: .id,
+            name: .name,
+            has_pw: (.login.password != null and .login.password != ""),
+            has_totp: ((.login.totp // "") != ""),
+            has_passkey: has_passkey(.),
+            field_count: (.fields // [] | length),
+            has_notes: (.notes != null and .notes != "")
+          })
+        }
+      )
     '
 }
 
 compute_merge_plan() {
     local raw_json="$1"
-    echo "$raw_json" | jq '
-      def has_passkey(item):
-        (item.login.fido2Credentials != null and (item.login.fido2Credentials | length) > 0);
-
-      map(select(.type == 1 and .login.username != null and .login.username != "")) |
+    echo "$raw_json" | jq "${JQ_DOMAIN_PASSKEY_HELPERS}"'
+      map(
+        select(.type == 1 and (.login.username // "") != "") |
+        . as $it |
+        (item_main_domains($it)) as $doms |
+        select(($doms | length) > 0)
+      ) |
       group_by({
         u: .login.username,
-        p: .login.password
+        p: (.login.password // ""),
+        doms: item_main_domains(.),
+        has_pk: has_passkey(.)
       }) |
       map(select(length > 1)) as $clusters |
 
       [ $clusters[] |
-        sort_by(if has_passkey(.) then 0 else 1 end) as $sorted |
+        sort_by((if has_passkey(.) then 0 else 1 end), (if (.login.totp // "") != "" then 0 else 1 end)) as $sorted |
         $sorted[0] as $canonical |
         $sorted[1:] as $redundants |
 
-        ($redundants | map(select(has_passkey(.))) | length) as $unsafe_passkeys |
+        (if has_passkey($canonical) then
+           ($redundants | map(select(norm_passkeys(.login.fido2Credentials) != norm_passkeys($canonical.login.fido2Credentials))) | length)
+         else
+           0
+         end) as $unsafe_passkeys |
+        ([ $sorted[] | (.login.totp // "") | select(. != "") ] | unique) as $distinct_totps |
         
         if $unsafe_passkeys > 0 then
           {
@@ -1614,12 +1730,27 @@ compute_merge_plan() {
             redundant_ids_to_delete: [],
             reason: "Multiple items hold independent FIDO2 Passkeys"
           }
+        elif ($distinct_totps | length) > 1 then
+          {
+            status: "CONFLICT_MULTIPLE_TOTP",
+            canonical_id: $canonical.id,
+            name: $canonical.name,
+            username: $canonical.login.username,
+            skip_deletion: true,
+            conflict_items: $sorted,
+            redundant_ids_to_delete: [],
+            reason: "Multiple items hold different 2FA TOTP secrets"
+          }
         else
+          (if ($distinct_totps | length) == 1 and (($canonical.login.totp // "") == "") then $distinct_totps[0] else "" end) as $added_totp |
           ($redundants | map(.notes // "") | map(select(. != "" and . != ($canonical.notes // ""))) | unique | join("\n---\n")) as $extra_notes |
           ([ $redundants[].fields[]? | select(.name as $n | (($canonical.fields // []) | map(.name) | index($n)) == null) ] | unique_by(.name)) as $new_fields |
           ([ $redundants[].login.uris[]? | select(.uri as $u | (($canonical.login.uris // []) | map(.uri) | index($u)) == null) ] | unique_by(.uri)) as $new_uris |
 
           ($canonical |
+            if $added_totp != "" then
+              .login.totp = $added_totp
+            else . end |
             if $extra_notes != "" then
               .notes = (if (.notes // "") == "" then $extra_notes else (.notes + "\n---\n" + $extra_notes) end)
             else . end |
@@ -1638,6 +1769,7 @@ compute_merge_plan() {
             username: $canonical.login.username,
             canonical_changed: ($merged_item != $canonical),
             original_canonical: $canonical,
+            added_totp: ($added_totp != ""),
             added_notes: $extra_notes,
             added_fields: $new_fields,
             added_uris: ($new_uris | map(.uri)),
@@ -1684,11 +1816,11 @@ print_partial_duplicates_table() {
     local group_count
     group_count=$(echo "$partial_groups" | jq 'length')
 
-    log_info "Partial / Merge candidate clusters: ${BOLD}$group_count${RESET}"
+    log_info "Partial audit clusters: ${BOLD}$group_count${RESET} (audit view; merges strictly require identical user, pw, passkey & TOTP)"
     if [[ "$group_count" -gt 0 ]]; then
-        printf "\n${BOLD}%-22s │ %-20s │ %s${RESET}\n" "DOMAIN" "USERNAME" "CANDIDATE ATTRIBUTE COMPARISON"
-        printf "%s\n" "───────────────────────┼──────────────────────┼────────────────────────────────────────────────"
-        echo "$partial_groups" | jq -r '.[] | "\(.domain[0:22])|\(.username[0:20])|\(.items | map("[\(.id[0:8])... pw:\(.has_pw) passkey:\(.has_passkey) fields:\(.field_count)]") | join(" vs "))"' |
+        printf "\n${BOLD}%-22s │ %-20s │ %s${RESET}\n" "DOMAIN" "USERNAME" "AUDIT COMPARISON & MERGE ELIGIBILITY"
+        printf "%s\n" "───────────────────────┼──────────────────────┼────────────────────────────────────────────────────────"
+        echo "$partial_groups" | jq -r '.[] | "\(.domain[0:22])|\(.username[0:20])|\(.items | map("[\(.id[0:8])... pw:\(.has_pw) totp:\(.has_totp) passkey:\(.has_passkey) fields:\(.field_count)]") | join(" vs ")) (\(.merge_note))"' |
         awk -F '|' -v c1="$CYAN" -v r="$RESET" '{printf "%-22s │ %-20s │ " c1 "%s" r "\n", $1, $2, $3}'
     fi
 }
@@ -1771,12 +1903,12 @@ execute_merge_plan() {
     local total_deletions="$3"
 
     print_merge_plan_table "$merge_result"
-    printf "\n${YELLOW}Planned cleanup scope:${RESET} %d redundant item(s) to be removed (Passkeys strictly protected).\n" "$total_deletions"
+    printf "\n${YELLOW}Planned cleanup scope:${RESET} %d redundant item(s) to be removed (Passkeys & 2FA TOTP secrets strictly protected).\n" "$total_deletions"
 
     if [[ "$VERBOSE" == true ]]; then
         local conflict_entries conflict_total c_idx=0 c_json
-        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")')
-        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")] | length')
+        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.skip_deletion == true)')
+        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.skip_deletion == true)] | length')
         if [[ "$conflict_total" -gt 0 ]]; then
             while IFS= read -r -u 3 c_json; do
                 [[ -z "$c_json" ]] && continue
@@ -1818,8 +1950,8 @@ execute_merge_plan() {
         VERBOSE=true
         log_info "Switched to one-by-one verify mode for this operation."
         local conflict_entries conflict_total c_idx=0 c_json
-        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")')
-        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")] | length')
+        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.skip_deletion == true)')
+        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.skip_deletion == true)] | length')
         if [[ "$conflict_total" -gt 0 ]]; then
             while IFS= read -r -u 3 c_json; do
                 [[ -z "$c_json" ]] && continue
@@ -1996,13 +2128,14 @@ op_duplicate_workflow() {
     merge_result=$(compute_merge_plan "$raw_json")
     render_progress 4 4 "Evaluating merge candidates"
 
-    local exact_clusters content_clusters partial_clusters merge_clusters total_deletions passkey_conflicts
+    local exact_clusters content_clusters partial_clusters merge_clusters total_deletions passkey_conflicts totp_conflicts
     exact_clusters=$(echo "$exact_dups" | jq 'length')
     content_clusters=$(echo "$content_dups" | jq 'length')
     partial_clusters=$(echo "$partial_groups" | jq 'length')
     merge_clusters=$(echo "$merge_result" | jq '[.[] | select(.status == "MERGED")] | length')
     total_deletions=$(echo "$merge_result" | jq '[.[].redundant_ids_to_delete[]?] | length')
     passkey_conflicts=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")] | length')
+    totp_conflicts=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_TOTP")] | length')
 
     printf "\n" >&2
     printf "${BOLD}${CYAN}╭────────────────────────────────────────────────────────────────────────────╮${RESET}\n" >&2
@@ -2012,10 +2145,13 @@ op_duplicate_workflow() {
     printf "  • Passkeys protected (Safety Armor): ${BOLD}%d 🔒${RESET}\n" "$passkey_count" >&2
     printf "  • Tier 1 Exact duplicate clusters:  ${BOLD}%d${RESET} (Identical data & timestamps)\n" "$exact_clusters" >&2
     printf "  • Tier 2 Content duplicate clusters:${BOLD}%d${RESET} (Identical data, timestamps ignored)\n" "$content_clusters" >&2
-    printf "  • Tier 3 Partial match clusters:    ${BOLD}%d${RESET} (Same domain & username)\n" "$partial_clusters" >&2
+    printf "  • Tier 3 Partial audit clusters:    ${BOLD}%d${RESET} (Same main domain & username; audit view)\n" "$partial_clusters" >&2
     printf "  • Eligible merge clusters:          ${BOLD}%d${RESET}\n" "$merge_clusters" >&2
     if [[ "$passkey_conflicts" -gt 0 ]]; then
         printf "  • Passkey conflicts detected:       ${BOLD}${YELLOW}%d ⚠️${RESET} (Protected from merge)\n" "$passkey_conflicts" >&2
+    fi
+    if [[ "$totp_conflicts" -gt 0 ]]; then
+        printf "  • 2FA/TOTP conflicts detected:      ${BOLD}${YELLOW}%d ⚠️${RESET} (Protected from merge)\n" "$totp_conflicts" >&2
     fi
     printf "  • Redundant items safe to delete:   ${BOLD}%d${RESET}\n\n" "$total_deletions" >&2
 

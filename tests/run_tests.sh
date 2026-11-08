@@ -91,17 +91,19 @@ assert_contains "$out3" "app.teamgantt.com" "3.2: Contains teamgantt pair"
 assert_not_contains "$out3" "lucid.app" "3.3: Differentiates items with differing creation/revision dates"
 
 out4=$("$BIN" --file "$SCRIPT_DIR/fixture_duplicates.json" find-duplicates --tier content 2>&1)
-assert_contains "$out4" "Content-identical duplicate clusters: 3" "4.1: Groups items by payload, ignoring timestamps"
+assert_contains "$out4" "Content-identical duplicate clusters: 2" "4.1: Groups items by payload, keeping passkey & password items strictly separate"
 assert_contains "$out4" "lucid.app" "4.2: Successfully identifies lucid.app despite differing dates"
-assert_contains "$out4" "LOCKED 🔒" "4.3: Flags passkey-bearing item as LOCKED"
+assert_not_contains "$out4" "cccc3333-0000-0000-0000-000000000002" "4.3: Never mixes password-only entry with passkey entry in content tier"
 
 out5=$("$BIN" --file "$SCRIPT_DIR/fixture_duplicates.json" find-duplicates --tier partial 2>&1)
-assert_contains "$out5" "email.android.com" "5.1: Finds accounts with same domain & user but differing fields"
+assert_contains "$out5" "android.com" "5.1: Finds accounts with same main domain & user"
+assert_not_contains "$out5" "cccc3333" "5.2: Never groups password-only entry with passkey entry in partial tier"
 
 # --- 4. Merge Duplicates & Passkey Armor ---
 out6=$("$BIN" --file "$SCRIPT_DIR/fixture_duplicates.json" merge-duplicates 2>&1)
-assert_contains "$out6" "cccc3333-0000-0000-0000-000000000001" "6.1: Proposes password-only redundant item for deletion"
+assert_not_contains "$out6" "cccc3333-0000-0000-0000-000000000001" "6.1: Never merges/deletes password-only entry against passkey entry"
 assert_not_contains "$out6" "cccc3333-0000-0000-0000-000000000002" "6.2: STRICT ARMOR: Protects passkey ID from deletion"
+assert_contains "$out6" "dddd4444-0000-0000-0000-000000000002" "6.3: Safely merges pure password duplicates (dddd4444)"
 
 # --- 5. Mock BW Environment & Directory Fallback ---
 cp "$SCRIPT_DIR/fixture_all.json" "$SCRIPT_DIR/mock_vault/items.json"
@@ -119,11 +121,11 @@ assert_contains "$out8" "Redundant items safe to delete:" "8.2: Evaluates eligib
 out9=$("$BIN" --mock-bw "$SCRIPT_DIR/mock_vault" --apply merge-duplicates 2>&1)
 assert_contains "$out9" "Cleanup completed:" "9.1: Successfully executes merge and deletions in mock store"
 rem_items=$(jq 'length' "$SCRIPT_DIR/mock_vault/items.json")
-if [[ "$rem_items" -eq 9 ]]; then
-    printf "${GREEN}[PASS]${NC} 9.2: Correct count of remaining items after merge cleanup (9 items)\n"
+if [[ "$rem_items" -eq 10 ]]; then
+    printf "${GREEN}[PASS]${NC} 9.2: Correct count of remaining items after merge cleanup (10 items; cccc3333 passkey/pw kept separate)\n"
     pass_count=$((pass_count + 1))
 else
-    printf "${RED}[FAIL]${NC} 9.2: Expected 9 remaining items, found %d\n" "$rem_items"
+    printf "${RED}[FAIL]${NC} 9.2: Expected 10 remaining items, found %d\n" "$rem_items"
     fail_count=$((fail_count + 1))
 fi
 
@@ -250,20 +252,20 @@ assert_contains "$out_v_merge" "1 duplicate(s) deleted" "11.5b: Per-cluster [y/q
 cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
 out_v_all=$(printf "1\na\n" | \
     PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" -i -v duplicates 2>&1)
-assert_contains "$out_v_all" "4 duplicate(s) deleted" "11.6a: Answering 'a' applies all remaining clusters without additional confirmation prompts"
+assert_contains "$out_v_all" "3 duplicate(s) deleted" "11.6a: Answering 'a' applies all remaining clusters without additional confirmation prompts"
 rem_v_all=$(jq 'length' "$MOCK_LIVE_ITEMS")
-if [[ "$rem_v_all" -eq 4 ]]; then
-    printf "${GREEN}[PASS]${NC} 11.6b: All 4 duplicate clusters resolved cleanly via unified loop (4 canonical items left)\n"
+if [[ "$rem_v_all" -eq 5 ]]; then
+    printf "${GREEN}[PASS]${NC} 11.6b: All 3 eligible duplicate clusters resolved cleanly (5 items left; cccc3333 pw & passkey both kept)\n"
     pass_count=$((pass_count + 1))
 else
-    printf "${RED}[FAIL]${NC} 11.6b: Expected 4 remaining items after 'a', found %d\n" "$rem_v_all"
+    printf "${RED}[FAIL]${NC} 11.6b: Expected 5 remaining items after 'a', found %d\n" "$rem_v_all"
     fail_count=$((fail_count + 1))
 fi
 
 # 11.7: Non-interactive -v --apply with --file and --output uses the exact same per-cluster code path
 out_file_merge="$TMP_TEST_DIR/merged_out.json"
 out_file_res=$("$BIN" -v --file "$SCRIPT_DIR/fixture_duplicates.json" --output "$out_file_merge" --apply merge-duplicates 2>&1)
-assert_contains "$out_file_res" "4 duplicate(s) deleted" "11.7a: Headless -v --apply --output applies all clusters cleanly"
+assert_contains "$out_file_res" "3 duplicate(s) deleted" "11.7a: Headless -v --apply --output applies all eligible clusters cleanly"
 out_merged_fields=$(jq '[.[] | select(.id == "dddd4444-0000-0000-0000-000000000001") | .fields[]?.name] | sort | join(",")' -r "$out_file_merge")
 if [[ "$out_merged_fields" == "ImapHost,ServerPort" ]]; then
     printf "${GREEN}[PASS]${NC} 11.7b: Merged canonical attributes and deletions persisted to --output file\n"
@@ -389,6 +391,134 @@ cp "$DASH_NAME_JSON" "$SCRIPT_DIR/mock_vault/items.json"
 out_trim_all=$(printf "2\n v \n a \r\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_vault" 2>&1)
 assert_contains "$out_trim_all" "without further prompts" "12.7a: Logs explicit feedback when 'a' (apply all remaining) is selected"
 assert_contains "$out_trim_all" "2 name(s) updated" "12.7b: Trims whitespace and CR around 'v' and 'a' choices cleanly"
+
+# --- 10. Domain Boundary & Strict Passkey/Password Separation ---
+DOMAIN_SAFETY_JSON="$TMP_TEST_DIR/domain_safety.json"
+cat > "$DOMAIN_SAFETY_JSON" << 'EOF'
+[
+  { "id": "d-amz-de", "type": 1, "name": "Amazon DE", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://www.amazon.de", "match": 0}] } },
+  { "id": "d-amz-com", "type": 1, "name": "Amazon COM", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://www.amazon.com", "match": 0}] } },
+  { "id": "d-couk-a", "type": 1, "name": "Bank UK", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://login.bank.co.uk", "match": 0}] } },
+  { "id": "d-couk-b", "type": 1, "name": "Shop UK", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://www.shop.co.uk", "match": 0}] } },
+  { "id": "d-ip-1", "type": 1, "name": "Node 10", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "http://192.168.1.10:8006", "match": 0}] } },
+  { "id": "d-ip-2", "type": 1, "name": "Node 20", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "http://192.168.1.20:8006", "match": 0}] } },
+  { "id": "d-gh-1", "type": 1, "name": "Alice Pages", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://alice.github.io", "match": 0}] } },
+  { "id": "d-gh-2", "type": 1, "name": "Bob Pages", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [{"uri": "https://bob.github.io", "match": 0}] } },
+  { "id": "d-nourl-1", "type": 1, "name": "NoURL One", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [] } },
+  { "id": "d-nourl-2", "type": 1, "name": "NoURL Two", "login": { "username": "alice@example.com", "password": "SamePassword1!", "uris": [] } },
+  { "id": "d-pk-dom1", "type": 1, "name": "Passkey GitHub", "login": { "username": "alice@example.com", "password": null, "uris": [{"uri": "https://github.com", "match": 0}], "fido2Credentials": [{"credentialId": "pk-gh", "rpId": "github.com"}] } },
+  { "id": "d-pk-dom2", "type": 1, "name": "Passkey Google", "login": { "username": "alice@example.com", "password": null, "uris": [{"uri": "https://accounts.google.com", "match": 0}], "fido2Credentials": [{"credentialId": "pk-goog", "rpId": "google.com"}] } }
+]
+EOF
+
+out_diff_dom_merge=$("$BIN" --file "$DOMAIN_SAFETY_JSON" merge-duplicates 2>&1)
+assert_contains "$out_diff_dom_merge" "Duplicate clusters evaluated: 0" "13.1a: Never merges items with different main domains, IPs, .co.uk, github.io, or empty URIs"
+assert_contains "$out_diff_dom_merge" "Planned cleanup scope: 0 redundant item(s)" "13.1b: Proposes zero deletions across different main domains"
+
+out_diff_dom_partial=$("$BIN" --file "$DOMAIN_SAFETY_JSON" find-duplicates --tier partial 2>&1)
+assert_contains "$out_diff_dom_partial" "Partial audit clusters: 0" "13.1c: Partial tier never groups different main domains together"
+
+SUBDOMAIN_PK_JSON="$TMP_TEST_DIR/subdomain_pk.json"
+cat > "$SUBDOMAIN_PK_JSON" << 'EOF'
+[
+  { "id": "sub-1", "type": 1, "name": "Portal Sub", "notes": "Primary portal", "login": { "username": "bob", "password": "Pw!", "uris": [{"uri": "https://app.company.example", "match": 0}] } },
+  { "id": "sub-2", "type": 1, "name": "Auth Sub", "notes": "SSO endpoint", "login": { "username": "bob", "password": "Pw!", "uris": [{"uri": "https://auth.company.example/login", "match": 0}] } },
+  { "id": "couk-sub-1", "type": 1, "name": "UK Sub 1", "login": { "username": "bob", "password": "Pw!", "uris": [{"uri": "https://portal.vendor.co.uk", "match": 0}] } },
+  { "id": "couk-sub-2", "type": 1, "name": "UK Sub 2", "login": { "username": "bob", "password": "Pw!", "uris": [{"uri": "https://shop.vendor.co.uk", "match": 0}] } },
+  { "id": "mix-pw", "type": 1, "name": "Service PW", "login": { "username": "carol", "password": "SamePw!", "uris": [{"uri": "https://login.service.org", "match": 0}] } },
+  { "id": "mix-pk", "type": 1, "name": "Service PK", "login": { "username": "carol", "password": "SamePw!", "uris": [{"uri": "https://login.service.org", "match": 0}], "fido2Credentials": [{"credentialId": "pk-1", "rpId": "service.org"}] } },
+  { "id": "pk-clone-1", "type": 1, "name": "PK Clone", "creationDate": "2024-01-01T00:00:00Z", "login": { "username": "dan", "password": null, "uris": [{"uri": "https://id.passkey.org", "match": 0}], "fido2Credentials": [{"credentialId": "pk-same", "rpId": "passkey.org"}] } },
+  { "id": "pk-clone-2", "type": 1, "name": "PK Clone", "creationDate": "2024-02-01T00:00:00Z", "login": { "username": "dan", "password": null, "uris": [{"uri": "https://id.passkey.org", "match": 0}], "fido2Credentials": [{"credentialId": "pk-same", "rpId": "passkey.org"}] } },
+  { "id": "pk-multi-1", "type": 1, "name": "Multi PK", "login": { "username": "erin", "password": null, "uris": [{"uri": "https://vault.multi.org", "match": 0}], "fido2Credentials": [{"credentialId": "pk-keyA", "rpId": "multi.org"}] } },
+  { "id": "pk-multi-2", "type": 1, "name": "Multi PK", "login": { "username": "erin", "password": null, "uris": [{"uri": "https://vault.multi.org", "match": 0}], "fido2Credentials": [{"credentialId": "pk-keyB", "rpId": "multi.org"}] } }
+]
+EOF
+
+out_sub_content=$("$BIN" --file "$SUBDOMAIN_PK_JSON" find-duplicates --tier content 2>&1)
+assert_contains "$out_sub_content" "LOCKED 🔒" "13.2a: Content tier detects pure identical passkey clones and flags LOCKED"
+assert_not_contains "$out_sub_content" "mix-pw" "13.2b: Content tier never mixes password item with passkey item"
+
+out_sub_partial=$("$BIN" --file "$SUBDOMAIN_PK_JSON" find-duplicates --tier partial 2>&1)
+assert_contains "$out_sub_partial" "company.example" "13.3a: Partial tier groups subdomains of same main domain"
+assert_contains "$out_sub_partial" "vendor.co.uk" "13.3b: Partial tier groups subdomains of same .co.uk main domain"
+assert_not_contains "$out_sub_partial" "service.org" "13.3c: Partial tier never mixes password item with passkey item"
+
+out_sub_merged="$TMP_TEST_DIR/subdomain_merged.json"
+out_sub_res=$("$BIN" --file "$SUBDOMAIN_PK_JSON" --output "$out_sub_merged" --apply merge-duplicates 2>&1)
+assert_contains "$out_sub_res" "CONFLICT_MULTIPLE_PASSKEYS" "13.4a: Protects clusters with distinct independent passkeys via CONFLICT_MULTIPLE_PASSKEYS"
+assert_not_contains "$out_sub_res" "mix-pw" "13.4b: Never merges/deletes password item alongside passkey item"
+assert_contains "$out_sub_res" "3 duplicate(s) deleted" "13.4c: Merges subdomain pairs & identical passkey clone while protecting multi-passkey conflict"
+sub_rem_count=$(jq 'length' "$out_sub_merged")
+mix_still_there=$(jq '[.[] | select(.id == "mix-pw" or .id == "mix-pk" or .id == "pk-multi-1" or .id == "pk-multi-2")] | length' "$out_sub_merged")
+sub_notes=$(jq -r '.[] | select(.id == "sub-1") | .notes' "$out_sub_merged")
+if [[ "$sub_rem_count" -eq 7 && "$mix_still_there" -eq 4 && "$sub_notes" == *"SSO endpoint"* ]]; then
+    printf "${GREEN}[PASS]${NC} 13.5: Verified subdomain merge preserved mix-pw/mix-pk & multi-passkey items intact\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 13.5: Unexpected merge state (rem=%d, protected=%d, notes='%s')\n" "$sub_rem_count" "$mix_still_there" "$sub_notes"
+    fail_count=$((fail_count + 1))
+fi
+
+# --- 11. Credential Equality (Username, Password, Passkey) & TOTP 2FA Armor ---
+CRED_TOTP_JSON="$TMP_TEST_DIR/cred_totp_safety.json"
+cat > "$CRED_TOTP_JSON" << 'EOF'
+[
+  { "id": "u-alice", "type": 1, "name": "Site", "login": { "username": "alice", "password": "SamePw!", "uris": [{"uri": "https://sameuser.example", "match": 0}] } },
+  { "id": "u-bob", "type": 1, "name": "Site", "login": { "username": "bob", "password": "SamePw!", "uris": [{"uri": "https://sameuser.example", "match": 0}] } },
+  { "id": "u-alice-cap", "type": 1, "name": "Site", "login": { "username": "Alice", "password": "SamePw!", "uris": [{"uri": "https://sameuser.example", "match": 0}] } },
+  { "id": "u-empty-1", "type": 1, "name": "EmptyU1", "login": { "username": "", "password": "SamePw!", "uris": [{"uri": "https://emptyu.example", "match": 0}] } },
+  { "id": "u-empty-2", "type": 1, "name": "EmptyU2", "login": { "username": null, "password": "SamePw!", "uris": [{"uri": "https://emptyu.example", "match": 0}] } },
+  { "id": "pw-1", "type": 1, "name": "PwSite", "login": { "username": "carol", "password": "Password1!", "uris": [{"uri": "https://pwsite.example", "match": 0}] } },
+  { "id": "pw-2", "type": 1, "name": "PwSite", "login": { "username": "carol", "password": "Password2!", "uris": [{"uri": "https://pwsite.example", "match": 0}] } },
+  { "id": "pw-null", "type": 1, "name": "PwSite", "login": { "username": "carol", "password": null, "uris": [{"uri": "https://pwsite.example", "match": 0}] } },
+  { "id": "pk-set-a", "type": 1, "name": "PkPair", "login": { "username": "dan", "password": "SamePw!", "uris": [{"uri": "https://pkdiff.example", "match": 0}], "fido2Credentials": [{"credentialId": "cred-1", "rpId": "pkdiff.example"}] } },
+  { "id": "pk-set-b", "type": 1, "name": "PkPair", "login": { "username": "dan", "password": "SamePw!", "uris": [{"uri": "https://pkdiff.example", "match": 0}], "fido2Credentials": [{"credentialId": "cred-1", "rpId": "pkdiff.example"}, {"credentialId": "cred-2", "rpId": "pkdiff.example"}] } },
+  { "id": "totp-diff-1", "type": 1, "name": "TotpDiff", "login": { "username": "eve", "password": "SamePw!", "totp": "JBSWY3DPEHPK3PXP_ONE", "uris": [{"uri": "https://totpdiff.example", "match": 0}] } },
+  { "id": "totp-diff-2", "type": 1, "name": "TotpDiff", "login": { "username": "eve", "password": "SamePw!", "totp": "JBSWY3DPEHPK3PXP_TWO", "uris": [{"uri": "https://totpdiff.example", "match": 0}] } }
+]
+EOF
+
+out_cred_content=$("$BIN" --file "$CRED_TOTP_JSON" find-duplicates --tier content 2>&1)
+assert_contains "$out_cred_content" "Content-identical duplicate clusters: 0" "14.1: Content tier never treats differing usernames, passwords, passkey sets, or TOTPs as identical"
+
+out_cred_partial=$("$BIN" --file "$CRED_TOTP_JSON" find-duplicates --tier partial 2>&1)
+assert_contains "$out_cred_partial" "AUDIT ONLY: diff username case" "14.2a: Partial audit explicitly marks username-case mismatch as AUDIT ONLY"
+assert_contains "$out_cred_partial" "AUDIT ONLY: diff passwords" "14.2b: Partial audit explicitly marks differing passwords as AUDIT ONLY"
+assert_contains "$out_cred_partial" "AUDIT ONLY: diff passkeys" "14.2c: Partial audit explicitly marks differing passkey sets as AUDIT ONLY"
+assert_contains "$out_cred_partial" "AUDIT ONLY: diff TOTP" "14.2d: Partial audit explicitly marks differing TOTP secrets as AUDIT ONLY"
+
+out_cred_merged="$TMP_TEST_DIR/cred_totp_merged.json"
+out_cred_merge=$("$BIN" -v --file "$CRED_TOTP_JSON" --output "$out_cred_merged" --apply merge-duplicates 2>&1)
+assert_contains "$out_cred_merge" "CONFLICT_MULTIPLE_PASSKEYS" "14.3a: Protects differing passkey subsets ([cred-1] vs [cred-1, cred-2]) via CONFLICT_MULTIPLE_PASSKEYS"
+assert_contains "$out_cred_merge" "CONFLICT_MULTIPLE_TOTP" "14.3b: Protects differing 2FA TOTP secrets via CONFLICT_MULTIPLE_TOTP"
+assert_contains "$out_cred_merge" "Planned cleanup scope: 0 redundant item(s)" "14.3c: Proposes zero deletions across differing users, passwords, passkeys, or TOTPs"
+assert_not_contains "$out_cred_merge" "JBSWY3DPEHPK3PXP_ONE" "14.3d: Masks TOTP secrets in verbose conflict output"
+
+TOTP_PRESERVE_JSON="$TMP_TEST_DIR/totp_preserve.json"
+cat > "$TOTP_PRESERVE_JSON" << 'EOF'
+[
+  { "id": "tp-no-totp", "type": 1, "name": "Portal", "notes": "Legacy notes from browser", "login": { "username": "frank", "password": "SamePw!", "totp": null, "uris": [{"uri": "https://portal.example.org", "match": 0}] } },
+  { "id": "tp-with-totp", "type": 1, "name": "Portal", "notes": "Mobile setup", "login": { "username": "frank", "password": "SamePw!", "totp": "JBSWY3DPEHPK3PXP_ONLY", "uris": [{"uri": "https://m.portal.example.org", "match": 0}] } }
+]
+EOF
+
+out_tp_content=$("$BIN" --file "$TOTP_PRESERVE_JSON" find-duplicates --tier content 2>&1)
+assert_contains "$out_tp_content" "Content-identical duplicate clusters: 0" "14.4: Content tier distinguishes item without TOTP from item with TOTP"
+
+out_tp_merged="$TMP_TEST_DIR/totp_preserved_out.json"
+out_tp_res=$("$BIN" -v --file "$TOTP_PRESERVE_JSON" --output "$out_tp_merged" --apply merge-duplicates 2>&1)
+assert_contains "$out_tp_res" "1 duplicate(s) deleted" "14.5: Consolidates matching user/pw/domain entries while preserving single TOTP secret"
+assert_not_contains "$out_tp_res" "JBSWY3DPEHPK3PXP_ONLY" "14.5b: Never leaks plaintext TOTP secret in verbose merge card"
+tp_count=$(jq 'length' "$out_tp_merged")
+tp_totp=$(jq -r '.[0].login.totp // ""' "$out_tp_merged")
+tp_notes=$(jq -r '.[0].notes // ""' "$out_tp_merged")
+if [[ "$tp_count" -eq 1 && "$tp_totp" == "JBSWY3DPEHPK3PXP_ONLY" && "$tp_notes" == *"Legacy notes from browser"* ]]; then
+    printf "${GREEN}[PASS]${NC} 14.6: Verified surviving canonical item retains TOTP secret & consolidated notes\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 14.6: Unexpected TOTP preserve state (count=%d, totp='%s', notes='%s')\n" "$tp_count" "$tp_totp" "$tp_notes"
+    fail_count=$((fail_count + 1))
+fi
 
 if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
     rm -rf "$PARENT_DIR/.bin"

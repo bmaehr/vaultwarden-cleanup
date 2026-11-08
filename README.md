@@ -57,9 +57,9 @@ Optional overrides: `set VWC_RUNNER=wsl` or `bash`, `set VWC_WSL_DISTRO=<distro>
    - Generates `Domain (Username)` names for login items whose `name` is `null`, empty/whitespace, or `--`.
 3. **Smart Duplicate Analysis & Safe Merge (`duplicates`, `find-duplicates`, `merge-duplicates`)**
    - **Tier 1 (`exact`):** Identical attributes and server timestamps (ignores `id`).
-   - **Tier 2 (`content`):** Identical login, password, URIs, notes, and custom fields (ignores timestamps and `id`).
-   - **Tier 3 (`partial`):** Groups items sharing the same domain and username for attribute consolidation.
-   - **Passkey & Data-Loss Armor:** Items holding `fido2Credentials` are always kept as canonical records and never deleted. Clusters with multiple distinct passkeys are flagged as `CONFLICT_MULTIPLE_PASSKEYS` and skipped. Redundant duplicates are only deleted after the canonical item update succeeds.
+   - **Tier 2 (`content`):** Identical login, password, TOTP secret, URIs, notes, custom fields, and passkeys (ignores timestamps and `id`).
+   - **Tier 3 (`partial`):** Audit view grouping items sharing the same username, passkey state, and main domain (`eTLD+1`), marking each cluster as merge-eligible or audit-only.
+   - **Credential, Domain & 2FA Armor:** Merges strictly require matching exact username, password, passkey state, compatible TOTP (never merging different TOTP secrets; preserving a single TOTP secret on merge), and identical main-domain set across URIs (`eTLD+1`, allowing subdomains of the same main domain while never merging across different main domains or empty URIs). Passkey items and password-only items are kept strictly separate and never merged together; clusters with multiple distinct passkeys (`CONFLICT_MULTIPLE_PASSKEYS`) or differing TOTP secrets (`CONFLICT_MULTIPLE_TOTP`) are flagged and skipped, and redundant duplicates are deleted only after canonical updates succeed.
 
 ---
 
