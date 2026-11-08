@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$PARENT_DIR/vault_manager.sh"
+BIN="$PARENT_DIR/vaultwarden-cleanup.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,7 +41,7 @@ assert_not_contains() {
 }
 
 printf "\n${BOLD}${CYAN}====================================================================${NC}\n"
-printf "${BOLD}${CYAN}   OFFLINE SIMULATION SUITE: VAULTWARDEN & BITWARDEN TOOLKIT       ${NC}\n"
+printf "${BOLD}${CYAN}   OFFLINE SIMULATION SUITE: VAULTWARDEN-CLEANUP                    ${NC}\n"
 printf "${BOLD}${CYAN}====================================================================${NC}\n\n"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -374,6 +374,21 @@ out_dash_preview=$("$BIN" -v --file "$DASH_NAME_JSON" fix-names 2>&1)
 assert_contains "$out_dash_preview" "grafana.internal.lan (ops)" "12.5a: Treats '--' entry name as missing name"
 assert_contains "$out_dash_preview" "proxmox.internal.lan (root)" "12.5b: Treats whitespace-padded ' -- ' as missing name"
 assert_contains "$out_dash_preview" "- Before: --" "12.5c: Preserves original '--' in verbose before/after diff"
+
+# 12.6: Windows path translation via wslpath/cygpath (when running under WSL/MSYS)
+if command -v wslpath >/dev/null 2>&1; then
+    WIN_DASH_PATH=$(wslpath -w "$DASH_NAME_JSON" 2>/dev/null || true)
+    if [[ -n "$WIN_DASH_PATH" ]]; then
+        out_win_path=$("$BIN" --file "$WIN_DASH_PATH" fix-names 2>&1)
+        assert_contains "$out_win_path" "grafana.internal.lan (ops)" "12.6: Accepts Windows-style --file path under WSL"
+    fi
+fi
+
+# 12.7: Trims whitespace/CR on decision input and logs explicit feedback when 'a' is chosen
+cp "$DASH_NAME_JSON" "$SCRIPT_DIR/mock_vault/items.json"
+out_trim_all=$(printf "2\n v \n a \r\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_vault" 2>&1)
+assert_contains "$out_trim_all" "without further prompts" "12.7a: Logs explicit feedback when 'a' (apply all remaining) is selected"
+assert_contains "$out_trim_all" "2 name(s) updated" "12.7b: Trims whitespace and CR around 'v' and 'a' choices cleanly"
 
 if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
     rm -rf "$PARENT_DIR/.bin"

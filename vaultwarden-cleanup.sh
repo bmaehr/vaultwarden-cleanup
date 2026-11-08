@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Bitwarden / Vaultwarden Maintenance & Deduplication Engine
+# vaultwarden-cleanup — Bitwarden / Vaultwarden Maintenance & Deduplication CLI
 # Interactive CLI Wizard + Command-Line Automation with Visual Progress Bars
 # ==============================================================================
 # Features:
@@ -133,6 +133,24 @@ render_progress() {
     fi
 }
 
+trim_whitespace() {
+    local s="${1:-}"
+    s="${s//$'\r'/}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+flush_tty_input() {
+    if [[ -t 0 ]] && [[ -r /dev/tty ]]; then
+        local _i=0 _discard=""
+        while (( _i < 16 )) && IFS= read -r -t 0 </dev/tty 2>/dev/null; do
+            IFS= read -r -t 0.001 -n 4096 _discard </dev/tty 2>/dev/null || break
+            _i=$((_i + 1))
+        done
+    fi
+}
+
 read_tty_line() {
     local __var_name="$1"
     local __line=""
@@ -158,12 +176,14 @@ read_tty_secret() {
 
 prompt_yes_default() {
     local question="$1"
+    flush_tty_input
     printf "\n${BOLD}${YELLOW}Action required:${RESET}\n" >&2
     printf "  %s\n" "$question" >&2
     printf "  [Y/n] (Default: Yes): " >&2
 
     local choice=""
     read_tty_line choice
+    choice="$(trim_whitespace "$choice")"
     case "$choice" in
         ""|[yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
             return 0
@@ -178,6 +198,7 @@ prompt_yes_default() {
 prompt_confirmation() {
     local action_description="$1"
     CONFIRM_ACTION="cancel"
+    flush_tty_input
     while true; do
         printf "\n${BOLD}${YELLOW}Action required:${RESET}\n" >&2
         printf "  Do you want to execute the planned operation ${BOLD}%s${RESET} now?\n" "$action_description" >&2
@@ -185,6 +206,7 @@ prompt_confirmation() {
 
         local choice=""
         read_tty_line choice
+        choice="$(trim_whitespace "$choice")"
         case "$choice" in
             [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
                 CONFIRM_ACTION="all"
@@ -209,11 +231,13 @@ prompt_confirmation() {
 # Interactive per-item confirmation prompt (used in interactive + verbose mode)
 prompt_verbose_item_decision() {
     local label="$1"
+    flush_tty_input
     while true; do
         printf "\n  ${BOLD}${YELLOW}%s${RESET}\n" "$label" >&2
         printf "  [y] Apply  [n] Skip (Default)  [a] Apply all remaining  [q] Cancel remaining: " >&2
         local choice=""
         read_tty_line choice
+        choice="$(trim_whitespace "$choice")"
         case "$choice" in
             [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
                 VERBOSE_DECISION="yes"
@@ -241,7 +265,7 @@ prompt_verbose_item_decision() {
 usage() {
     local exit_code="${1:-1}"
     cat <<EOF
-${BOLD}Vaultwarden & Bitwarden Maintenance Engine v${VERSION}${RESET}
+${BOLD}vaultwarden-cleanup v${VERSION}${RESET} (Bitwarden / Vaultwarden Cleanup CLI)
 
 Usage: $SCRIPT_NAME [OPTIONS] [COMMAND]
 
@@ -251,7 +275,7 @@ ${BOLD}Interactive Mode:${RESET}
 
 ${BOLD}Commands:${RESET}
   ${CYAN}fix-uris${RESET}             Extract URLs from notes/fields into login.uris (default: only entries without any URL)
-  ${CYAN}fix-names${RESET}            Generate names ('Domain (Username)') for entries without a name
+  ${CYAN}fix-names${RESET}            Generate names ('Domain (Username)') for entries without a name or named '--'
   ${CYAN}find-duplicates${RESET}      Locate duplicate items across multiple strictness tiers:
                          --tier exact    : Strict. Timestamps (creation/revision) must match.
                          --tier content  : Payload match. Ignores timestamps and IDs.
@@ -587,6 +611,7 @@ ensure_bw_authenticated() {
                     default_srv="$norm_current"
                 fi
 
+                flush_tty_input
                 if [[ -n "$default_srv" ]]; then
                     printf "  Vaultwarden Server URL [${CYAN}%s${RESET}]: " "$default_srv" >&2
                 else
@@ -594,6 +619,7 @@ ensure_bw_authenticated() {
                 fi
                 local input_srv=""
                 read_tty_line input_srv
+                input_srv="$(trim_whitespace "$input_srv")"
                 input_srv="${input_srv:-$default_srv}"
                 input_srv="$(normalize_server_url "$input_srv")"
 
@@ -611,6 +637,7 @@ ensure_bw_authenticated() {
                 log_success "Configured server: $input_srv"
             fi
 
+            flush_tty_input
             printf "\n  ${BOLD}Login Method:${RESET}\n" >&2
             printf "    [1] Email & Master Password (supports 2FA) [Default]\n" >&2
             printf "    [2] Personal API Key (client_id & client_secret)\n" >&2
@@ -620,6 +647,7 @@ ensure_bw_authenticated() {
 
             local auth_method=""
             read_tty_line auth_method
+            auth_method="$(trim_whitespace "$auth_method")"
             auth_method="${auth_method:-1}"
 
             case "$auth_method" in
@@ -627,6 +655,7 @@ ensure_bw_authenticated() {
                     printf "  Email address: " >&2
                     local bw_email=""
                     read_tty_line bw_email
+                    bw_email="$(trim_whitespace "$bw_email")"
                     if [[ -z "$bw_email" ]]; then
                         log_error "Email address cannot be empty."
                         continue
@@ -679,6 +708,7 @@ ensure_bw_authenticated() {
                     printf "  Client ID (e.g. user.xxxx...): " >&2
                     local bw_cid=""
                     read_tty_line bw_cid
+                    bw_cid="$(trim_whitespace "$bw_cid")"
                     printf "  Client Secret: " >&2
                     local bw_csecret=""
                     read_tty_secret bw_csecret
@@ -725,9 +755,11 @@ ensure_bw_authenticated() {
             read_tty_secret bw_pw
 
             if [[ -z "$bw_pw" ]]; then
+                flush_tty_input
                 printf "  Options: [u] Unlock  [l] Logout / Switch account or server  [q] Quit: " >&2
                 local lock_opt=""
                 read_tty_line lock_opt
+                lock_opt="$(trim_whitespace "$lock_opt")"
                 case "$lock_opt" in
                     l|L)
                         run_bw_capture logout --nointeraction || true
@@ -1019,6 +1051,8 @@ apply_modified_items_plan() {
                     ;;
                 all)
                     ask_each=false
+                    local rem_apply=$((modified_count - curr + 1))
+                    log_info "Applying this and remaining item(s) ($rem_apply item(s)) without further prompts..."
                     ;;
             esac
         fi
@@ -1316,6 +1350,7 @@ op_fix_uris() {
     log_info "Vault size: $total_items items"
 
     if [[ "$INTERACTIVE" == true && "$INCLUDE_EXISTING_URIS" != true && "$existing_extra_count" -gt 0 ]]; then
+        flush_tty_input
         printf "\n${BOLD}${YELLOW}Scope selection:${RESET}\n" >&2
         printf "  Found ${BOLD}%d${RESET} item(s) without any URL requiring migration.\n" "$modified_count" >&2
         printf "  Also found ${BOLD}%d${RESET} item(s) that already have a URL, with additional URL(s) in notes/fields.\n" "$existing_extra_count" >&2
@@ -1324,6 +1359,7 @@ op_fix_uris() {
         printf "  Selection [1-2] (Default: 1): " >&2
         local scope_choice=""
         read_tty_line scope_choice
+        scope_choice="$(trim_whitespace "$scope_choice")"
         case "$scope_choice" in
             2)
                 transformed_json=$(echo "$transformed_json" | jq '
@@ -1836,6 +1872,8 @@ execute_merge_plan() {
                     ;;
                 all)
                     ask_each=false
+                    local rem_clusters=$((total_clusters - curr_cluster + 1))
+                    log_info "Applying this and remaining cluster(s) ($rem_clusters cluster(s)) without further prompts..."
                     ;;
             esac
         fi
@@ -1991,6 +2029,7 @@ op_duplicate_workflow() {
         local v_label="${DIM}OFF${RESET}"
         [[ "$VERBOSE" == true ]] && v_label="${GREEN}ON${RESET}"
 
+        flush_tty_input
         printf "${BOLD}Duplicate Resolution Menu:${RESET}\n" >&2
         printf "  [1] Safe Merge & Cleanup (%d redundant item(s) to delete)\n" "$total_deletions" >&2
         printf "  [2] View Tier 1 details (Exact duplicates: %d cluster(s))\n" "$exact_clusters" >&2
@@ -2003,6 +2042,7 @@ op_duplicate_workflow() {
 
         local subchoice=""
         read_tty_line subchoice
+        subchoice="$(trim_whitespace "$subchoice")"
         subchoice="${subchoice:-b}"
 
         case "$subchoice" in
@@ -2066,14 +2106,15 @@ run_interactive_wizard() {
         local v_label="${DIM}OFF${RESET}"
         [[ "$VERBOSE" == true ]] && v_label="${GREEN}ON${RESET}"
 
+        flush_tty_input
         printf "\n${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${RESET}\n"
-        printf "${BOLD}${CYAN}║     VAULTWARDEN & BITWARDEN MAINTENANCE WIZARD                       ║${RESET}\n"
+        printf "${BOLD}${CYAN}║     VAULTWARDEN-CLEANUP INTERACTIVE WIZARD                           ║${RESET}\n"
         printf "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${RESET}\n"
         if [[ -n "$CONNECTED_ACCOUNT" ]]; then
             printf " ${DIM}Connected: %s (%s)${RESET}\n\n" "$EXEC_TARGET" "$CONNECTED_ACCOUNT"
         fi
         printf " [1] Fix KeePass URLs (migrate URLs from notes/fields for entries without a URL)\n"
-        printf " [2] Fix missing names (set 'Domain (Username)' for unnamed entries)\n"
+        printf " [2] Fix missing names (set 'Domain (Username)' for entries without a name or '--')\n"
         printf " [3] Analyze & resolve duplicates (smart multi-tier audit & merge)\n"
         printf " [v] Toggle verbose mode (currently: %s)\n" "$v_label"
         if [[ "$EXEC_TARGET" == "local" || "$EXEC_TARGET" == "docker" ]]; then
@@ -2088,6 +2129,7 @@ run_interactive_wizard() {
 
         local menu_choice=""
         read_tty_line menu_choice
+        menu_choice="$(trim_whitespace "$menu_choice")"
         menu_choice="${menu_choice:-q}"
 
         case "$menu_choice" in
@@ -2135,9 +2177,19 @@ run_interactive_wizard() {
 }
 
 # --- Main Entry Point ---
-main() {
-    check_dependencies
+normalize_cli_path() {
+    local p="${1:-}"
+    if [[ "$p" =~ ^[A-Za-z]:([\\/]|$) ]] || [[ "$p" == *\\* ]]; then
+        if command -v wslpath >/dev/null 2>&1; then
+            p="$(wslpath -u "$p" 2>/dev/null || printf '%s' "$p")"
+        elif command -v cygpath >/dev/null 2>&1; then
+            p="$(cygpath -u "$p" 2>/dev/null || printf '%s' "$p")"
+        fi
+    fi
+    printf '%s' "$p"
+}
 
+main() {
     local command=""
     local tier="exact"
 
@@ -2162,18 +2214,18 @@ main() {
                 ;;
             --file)
                 [[ $# -lt 2 ]] && { log_error "Option '$1' requires a file path."; usage; }
-                INPUT_FILE="$2"
+                INPUT_FILE="$(normalize_cli_path "$2")"
                 EXEC_TARGET="file"
                 shift 2
                 ;;
             --output)
                 [[ $# -lt 2 ]] && { log_error "Option '$1' requires a file path."; usage; }
-                OUTPUT_FILE="$2"
+                OUTPUT_FILE="$(normalize_cli_path "$2")"
                 shift 2
                 ;;
             --mock-bw)
                 [[ $# -lt 2 ]] && { log_error "Option '$1' requires a directory path."; usage; }
-                MOCK_BW_DIR="$2"
+                MOCK_BW_DIR="$(normalize_cli_path "$2")"
                 EXEC_TARGET="mock"
                 shift 2
                 ;;
@@ -2209,6 +2261,8 @@ main() {
                 ;;
         esac
     done
+
+    check_dependencies
 
     if [[ "$command" == "test-run" ]]; then
         if [[ -f "$SCRIPT_DIR/tests/run_tests.sh" ]]; then
