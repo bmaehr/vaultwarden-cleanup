@@ -294,6 +294,87 @@ out_uri_verify=$(printf "1\nv\ny\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_v
 assert_contains "$out_uri_verify" "UPDATE ITEM: Migrate KeePass Web Match URIs" "11.8f: URI cleanup supports switching to verify one-by-one at confirmation"
 assert_contains "$out_uri_verify" "1 item(s) updated" "11.8g: URI cleanup persists item verified after switching via 'v'"
 
+# --- 9. URI Scope Default (only missing URL) + '--' as missing name ---
+# 12.1-12.4: Entry with existing URI is skipped by default, updated only via --all-uris or interactive option [2]
+URI_TEST_JSON="$TMP_TEST_DIR/uri_scope_test.json"
+cat > "$URI_TEST_JSON" << 'EOF'
+[
+  {
+    "id": "u1111111-1111-1111-1111-111111111111",
+    "type": 1,
+    "name": "No URI Entry",
+    "notes": "Login at https://missing.example.com",
+    "login": { "username": "alice", "password": "pw1", "uris": [] },
+    "fields": []
+  },
+  {
+    "id": "u2222222-2222-2222-2222-222222222222",
+    "type": 1,
+    "name": "Has URI Entry",
+    "notes": "Docs at https://docs.example.com",
+    "login": { "username": "bob", "password": "pw2", "uris": [ { "uri": "https://primary.example.com", "match": 0 } ] },
+    "fields": []
+  }
+]
+EOF
+
+out_uri_def=$("$BIN" --file "$URI_TEST_JSON" fix-uris 2>&1)
+assert_contains "$out_uri_def" "https://missing.example.com" "12.1a: Default fix-uris proposes URL for entry with no URL"
+assert_not_contains "$out_uri_def" "https://docs.example.com" "12.1b: Default fix-uris skips entry that already has a URL"
+
+cp "$URI_TEST_JSON" "$MOCK_LIVE_ITEMS"
+out_uri_def_apply=$(PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" --apply fix-uris 2>&1)
+assert_contains "$out_uri_def_apply" "1 item(s) successfully updated" "12.2a: Default --apply fix-uris updates only item without any URL"
+has_uri_count=$(jq '[.[] | select(.id == "u2222222-2222-2222-2222-222222222222") | .login.uris[]] | length' "$MOCK_LIVE_ITEMS")
+if [[ "$has_uri_count" -eq 1 ]]; then
+    printf "${GREEN}[PASS]${NC} 12.2b: Existing-URI item left untouched in default mode\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 12.2b: Existing-URI item should keep 1 URI by default, found %d\n" "$has_uri_count"
+    fail_count=$((fail_count + 1))
+fi
+
+cp "$URI_TEST_JSON" "$MOCK_LIVE_ITEMS"
+out_uri_all_apply=$(PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" --all-uris --apply fix-uris 2>&1)
+assert_contains "$out_uri_all_apply" "2 item(s) successfully updated" "12.3a: --all-uris updates both items with and without existing URLs"
+has_uri_count_all=$(jq '[.[] | select(.id == "u2222222-2222-2222-2222-222222222222") | .login.uris[]] | length' "$MOCK_LIVE_ITEMS")
+if [[ "$has_uri_count_all" -eq 2 ]]; then
+    printf "${GREEN}[PASS]${NC} 12.3b: --all-uris appended extra URL to item with existing URI\n"
+    pass_count=$((pass_count + 1))
+else
+    printf "${RED}[FAIL]${NC} 12.3b: Expected 2 URIs with --all-uris, found %d\n" "$has_uri_count_all"
+    fail_count=$((fail_count + 1))
+fi
+
+cp "$URI_TEST_JSON" "$MOCK_LIVE_ITEMS"
+# Interactive fix-uris: choose '2' (Include items that already have URIs) -> 'y' (apply all)
+out_uri_wiz_all=$(printf "2\ny\n" | \
+    PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" -i fix-uris 2>&1)
+assert_contains "$out_uri_wiz_all" "2 item(s) successfully updated" "12.4: Interactive fix-uris option [2] includes entries with existing URIs"
+
+# 12.5: Entries named '--' are treated as having no name
+DASH_NAME_JSON="$TMP_TEST_DIR/dash_name.json"
+cat > "$DASH_NAME_JSON" << 'EOF'
+[
+  {
+    "id": "n1111111-1111-1111-1111-111111111111",
+    "type": 1,
+    "name": "--",
+    "login": { "username": "ops", "password": "pw", "uris": [ { "uri": "https://grafana.internal.lan/login", "match": 0 } ] }
+  },
+  {
+    "id": "n2222222-2222-2222-2222-222222222222",
+    "type": 1,
+    "name": " -- ",
+    "login": { "username": "root", "password": "pw", "uris": [ { "uri": "https://proxmox.internal.lan", "match": 0 } ] }
+  }
+]
+EOF
+out_dash_preview=$("$BIN" -v --file "$DASH_NAME_JSON" fix-names 2>&1)
+assert_contains "$out_dash_preview" "grafana.internal.lan (ops)" "12.5a: Treats '--' entry name as missing name"
+assert_contains "$out_dash_preview" "proxmox.internal.lan (root)" "12.5b: Treats whitespace-padded ' -- ' as missing name"
+assert_contains "$out_dash_preview" "- Before: --" "12.5c: Preserves original '--' in verbose before/after diff"
+
 if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
     rm -rf "$PARENT_DIR/.bin"
 fi

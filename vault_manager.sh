@@ -29,6 +29,7 @@ VERSION="2.5.0"
 MODE="preview"            # "preview" (default dry-run) or "apply"
 INTERACTIVE=false         # Set to true when called with -i / --interactive or no arguments
 VERBOSE=false             # Set to true via -v / --verbose or wizard toggle
+INCLUDE_EXISTING_URIS=false # By default fix-uris only updates entries without any URI; true with --all-uris
 EXEC_TARGET="local"       # "local", "docker", "file", or "mock"
 DOCKER_CONTAINER=""
 INPUT_FILE=""
@@ -249,7 +250,7 @@ ${BOLD}Interactive Mode:${RESET}
   $SCRIPT_NAME -i -v            Start wizard in verbose mode (per-item diff & step-by-step [y/n/a/q] prompt)
 
 ${BOLD}Commands:${RESET}
-  ${CYAN}fix-uris${RESET}             Extract URLs from notes/fields into login.uris (KeePass cleanup)
+  ${CYAN}fix-uris${RESET}             Extract URLs from notes/fields into login.uris (default: only entries without any URL)
   ${CYAN}fix-names${RESET}            Generate names ('Domain (Username)') for entries without a name
   ${CYAN}find-duplicates${RESET}      Locate duplicate items across multiple strictness tiers:
                          --tier exact    : Strict. Timestamps (creation/revision) must match.
@@ -268,6 +269,7 @@ ${BOLD}Options:${RESET}
   --mock-bw <dir>      Simulate a live Bitwarden CLI environment using a mock state directory
   --docker <container> Run 'bw' inside a Bitwarden CLI container (not the vaultwarden/server container)
   --apply              Apply modifications directly (Default is DRY-RUN preview only)
+  --all-uris           With 'fix-uris', also append URLs found in notes/fields to items that already have URIs
   --output <path>      Save modified JSON to file (when using --file)
   --tier <name>        Duplicate detection tier: 'exact' (default), 'content', 'partial'
   -h, --help           Show this help message
@@ -1023,7 +1025,7 @@ apply_modified_items_plan() {
 
         local item_idx clean_item
         item_idx=$(printf '%s\n' "$raw_item" | jq -r '._idx // empty')
-        clean_item=$(printf '%s\n' "$raw_item" | jq -c 'del(._idx, ._modified, ._added_uris, ._old_uris, ._old_name)')
+        clean_item=$(printf '%s\n' "$raw_item" | jq -c 'del(._idx, ._modified, ._added_uris, ._old_uris, ._old_name, ._extra_uri_candidate, ._candidate_uris)')
 
         if bw_update_item "$clean_item" "$item_idx"; then
             ok_count=$((ok_count + 1))
@@ -1265,9 +1267,11 @@ op_fix_uris() {
     render_progress "$total_items" "$total_items" "Scanning items"
 
     local transformed_json
-    transformed_json=$(echo "$raw_json" | jq '
+    transformed_json=$(echo "$raw_json" | jq --argjson include_existing "$INCLUDE_EXISTING_URIS" '
       def extract_urls_from_text:
         [scan("(https?://[a-zA-Z0-9./?=_-]+)")] | map({uri: .[0], match: 0});
+      def unique_uris:
+        reduce .[] as $u ([]; if any(.[]; .uri == $u.uri) then . else . + [$u] end);
 
       to_entries | map(
         .key as $idx | .value |
@@ -1277,14 +1281,24 @@ op_fix_uris() {
           ([$item.fields[]? | select(.type == 0 and (.value | test("^https?://")))? | {uri: .value, match: 0}]) as $field_urls |
           ($note_urls + $field_urls) as $found_urls |
           ($item.login.uris // []) as $existing_uris |
-          ($found_urls | map(select(.uri as $u | ($existing_uris | map(.uri) | index($u)) == null))) as $new_uris |
-          
+          ([$existing_uris[] | select(((.uri // "") | gsub("^\\s+|\\s+$"; "")) != "")]) as $nonempty_uris |
+          (($nonempty_uris | length) == 0) as $has_no_uri |
+          ([$found_urls[] | select(.uri as $u | ($nonempty_uris | map(.uri) | index($u)) == null)] | unique_uris) as $new_uris |
+
           if ($new_uris | length) > 0 then
-            ._idx = $idx |
-            ._old_uris = ($existing_uris | map(.uri)) |
-            .login.uris = ($existing_uris + $new_uris) |
-            ._modified = true |
-            ._added_uris = ($new_uris | map(.uri))
+            if $has_no_uri or $include_existing then
+              ._idx = $idx |
+              ._old_uris = ($nonempty_uris | map(.uri)) |
+              .login.uris = ($nonempty_uris + $new_uris) |
+              ._modified = true |
+              ._added_uris = ($new_uris | map(.uri))
+            else
+              ._idx = $idx |
+              ._old_uris = ($nonempty_uris | map(.uri)) |
+              ._candidate_uris = ($nonempty_uris + $new_uris) |
+              ._added_uris = ($new_uris | map(.uri)) |
+              ._extra_uri_candidate = true
+            end
           else
             .
           end
@@ -1294,12 +1308,49 @@ op_fix_uris() {
       )
     ')
 
-    local modified_count
+    local modified_count existing_extra_count
     modified_count=$(echo "$transformed_json" | jq '[.[] | select(._modified == true)] | length')
-    
+    existing_extra_count=$(echo "$transformed_json" | jq '[.[] | select(._extra_uri_candidate == true)] | length')
+
     printf "\n" >&2
     log_info "Vault size: $total_items items"
+
+    if [[ "$INTERACTIVE" == true && "$INCLUDE_EXISTING_URIS" != true && "$existing_extra_count" -gt 0 ]]; then
+        printf "\n${BOLD}${YELLOW}Scope selection:${RESET}\n" >&2
+        printf "  Found ${BOLD}%d${RESET} item(s) without any URL requiring migration.\n" "$modified_count" >&2
+        printf "  Also found ${BOLD}%d${RESET} item(s) that already have a URL, with additional URL(s) in notes/fields.\n" "$existing_extra_count" >&2
+        printf "  [1] Only items without any URL (%d item(s)) [Default]\n" "$modified_count" >&2
+        printf "  [2] Include items that already have URIs (%d item(s) total)\n" "$((modified_count + existing_extra_count))" >&2
+        printf "  Selection [1-2] (Default: 1): " >&2
+        local scope_choice=""
+        read_tty_line scope_choice
+        case "$scope_choice" in
+            2)
+                transformed_json=$(echo "$transformed_json" | jq '
+                  map(
+                    if ._extra_uri_candidate == true then
+                      .login.uris = ._candidate_uris |
+                      ._modified = true |
+                      del(._extra_uri_candidate, ._candidate_uris)
+                    else
+                      .
+                    end
+                  )
+                ')
+                modified_count=$(echo "$transformed_json" | jq '[.[] | select(._modified == true)] | length')
+                existing_extra_count=0
+                log_info "Included items that already have URIs (total to update: $modified_count)."
+                ;;
+            *)
+                log_info "Keeping items that already have URIs unchanged."
+                ;;
+        esac
+    fi
+
     log_info "Items requiring URI migration: ${BOLD}$modified_count${RESET}"
+    if [[ "$existing_extra_count" -gt 0 ]]; then
+        log_info "Items already having URIs with extra links in notes/fields: ${BOLD}$existing_extra_count${RESET} (skipped by default; use --all-uris to include)"
+    fi
 
     if [[ "$modified_count" -gt 0 ]]; then
         printf "\n${BOLD}%-36s │ %-25s │ %s${RESET}\n" "ITEM ID" "NAME" "MIGRATED URIS"
@@ -1311,7 +1362,11 @@ op_fix_uris() {
     fi
 
     if [[ "$modified_count" -eq 0 ]]; then
-        log_success "All entries already have clean web match URIs. Nothing to do."
+        if [[ "$existing_extra_count" -gt 0 ]]; then
+            log_success "All entries without a URL are clean ($existing_extra_count item(s) with existing URIs were skipped)."
+        else
+            log_success "All entries already have clean web match URIs. Nothing to do."
+        fi
         return 0
     fi
 
@@ -1350,7 +1405,8 @@ op_fix_names() {
           ($item.login.username // "") as $user |
           extract_domain($uri) as $dom |
           
-          ($item.name == null or (($item.name | gsub("^\\s+|\\s+$"; "")) == "")) as $is_missing |
+          ($item.name // "" | gsub("^\\s+|\\s+$"; "")) as $trimmed_name |
+          ($item.name == null or $trimmed_name == "" or $trimmed_name == "--") as $is_missing |
           
           if $is_missing and ($dom != "" or $user != "") then
             (if $dom != "" and $user != "" then
@@ -1363,7 +1419,7 @@ op_fix_names() {
             
             if $item.name != $generated_name then
               ._idx = $idx |
-              ._old_name = "<empty>" |
+              ._old_name = (if $trimmed_name == "" then "<empty>" else $trimmed_name end) |
               .name = $generated_name |
               ._modified = true
             else
@@ -2016,7 +2072,7 @@ run_interactive_wizard() {
         if [[ -n "$CONNECTED_ACCOUNT" ]]; then
             printf " ${DIM}Connected: %s (%s)${RESET}\n\n" "$EXEC_TARGET" "$CONNECTED_ACCOUNT"
         fi
-        printf " [1] Fix KeePass URLs (migrate URLs from notes/fields into URI matches)\n"
+        printf " [1] Fix KeePass URLs (migrate URLs from notes/fields for entries without a URL)\n"
         printf " [2] Fix missing names (set 'Domain (Username)' for unnamed entries)\n"
         printf " [3] Analyze & resolve duplicates (smart multi-tier audit & merge)\n"
         printf " [v] Toggle verbose mode (currently: %s)\n" "$v_label"
@@ -2129,6 +2185,10 @@ main() {
                 ;;
             --apply)
                 MODE="apply"
+                shift
+                ;;
+            --all-uris)
+                INCLUDE_EXISTING_URIS=true
                 shift
                 ;;
             --tier)

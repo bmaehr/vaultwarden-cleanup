@@ -36,8 +36,8 @@ export BW_SESSION="your_session_key"
 
 ### Interactive Workflow:
 1. **Main Menu:**
-   - `[1]` Fix KeePass URLs (migrate URLs from notes/fields into URI matches)
-   - `[2]` Fix missing names (set 'Domain (Username)' for unnamed entries)
+   - `[1]` Fix KeePass URLs (migrate URLs from notes/fields for entries without a URL; optionally include items that already have URIs)
+   - `[2]` Fix missing names (set 'Domain (Username)' for entries without a name or named `--`)
    - `[3]` Analyze & resolve duplicates (smart multi-tier audit & passkey-protected merge)
    - `[v]` Toggle verbose mode (per-item before/after diff cards + `[y/n/a/q]` confirmation)
    - `[l]` Logout Bitwarden CLI session (when connected to a live CLI target)
@@ -79,8 +79,8 @@ export BW_SESSION="your_session_key"
 # 3. Dry-run preview of merge plan (add -v for full per-cluster before/after diff cards)
 ./vault_manager.sh -v --file export.json merge-duplicates
 
-# 4. Migrate KeePass URIs and write to clean file
-./vault_manager.sh --file export.json fix-uris --output clean_vault.json
+# 4. Migrate KeePass URIs (entries without a URL by default; add --all-uris to include entries that already have URIs)
+./vault_manager.sh --file export.json fix-uris --apply --output clean_vault.json
 ```
 
 ---
