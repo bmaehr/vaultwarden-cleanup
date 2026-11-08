@@ -43,6 +43,7 @@ DETECTED_SERVER_HINT=""
 CAPTURED_STDOUT=""
 CAPTURED_STDERR=""
 VERBOSE_DECISION="no"
+CONFIRM_ACTION="cancel"
 WORKING_VAULT_JSON=""
 
 # Terminal styling (protected against unset TERM / set -e failure)
@@ -175,21 +176,33 @@ prompt_yes_default() {
 # Interactive confirmation prompt
 prompt_confirmation() {
     local action_description="$1"
-    printf "\n${BOLD}${YELLOW}Action required:${RESET}\n" >&2
-    printf "  Do you want to execute the planned operation ${BOLD}%s${RESET} now?\n" "$action_description" >&2
-    printf "  [y/N] (Default: No, Cancel): " >&2
-    
-    local choice=""
-    read_tty_line choice
-    case "$choice" in
-        [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
-            return 0
-            ;;
-        *)
-            log_warn "Operation cancelled. No data was modified."
-            return 1
-            ;;
-    esac
+    CONFIRM_ACTION="cancel"
+    while true; do
+        printf "\n${BOLD}${YELLOW}Action required:${RESET}\n" >&2
+        printf "  Do you want to execute the planned operation ${BOLD}%s${RESET} now?\n" "$action_description" >&2
+        printf "  [y] Yes (apply all)  [v] Verify one-by-one  [N] No, Cancel (Default): " >&2
+
+        local choice=""
+        read_tty_line choice
+        case "$choice" in
+            [yY]|[yY][eE][sS]|[jJ]|[jJ][aA])
+                CONFIRM_ACTION="all"
+                return 0
+                ;;
+            [vV]|[vV][eE][rR][iI][fF][yY])
+                CONFIRM_ACTION="verify"
+                return 0
+                ;;
+            ""|[nN]|[nN][oO]|[nN][eE][iI][nN])
+                CONFIRM_ACTION="cancel"
+                log_warn "Operation cancelled. No data was modified."
+                return 1
+                ;;
+            *)
+                log_error "Please enter y (apply all), v (verify one-by-one), or n (cancel)."
+                ;;
+        esac
+    done
 }
 
 # Interactive per-item confirmation prompt (used in interactive + verbose mode)
@@ -941,12 +954,16 @@ apply_modified_items_plan() {
 
     local preview_only=false
     local ask_each=false
+    local prev_verbose="$VERBOSE"
     if [[ "$INTERACTIVE" == true ]]; then
         if [[ "$VERBOSE" == true ]]; then
             ask_each=true
         else
             if ! prompt_confirmation "$batch_label"; then
                 return 0
+            fi
+            if [[ "$CONFIRM_ACTION" == "verify" ]]; then
+                ask_each=true
             fi
         fi
     elif [[ "$MODE" == "preview" ]]; then
@@ -956,6 +973,11 @@ apply_modified_items_plan() {
     if [[ "$preview_only" != true && "$EXEC_TARGET" == "file" && -z "$OUTPUT_FILE" ]]; then
         log_error "Input '--file' mode is read-only. Re-run with '--output <file>' to save changes."
         return 1
+    fi
+
+    if [[ "$ask_each" == true && "$VERBOSE" != true ]]; then
+        VERBOSE=true
+        log_info "Switched to one-by-one verify mode for this operation."
     fi
 
     if [[ "$preview_only" == true && "$VERBOSE" != true ]]; then
@@ -1045,6 +1067,7 @@ apply_modified_items_plan() {
         fi
     fi
 
+    VERBOSE="$prev_verbose"
     [[ $fail_count_upd -gt 0 ]] && return 1
     return 0
 }
@@ -1678,12 +1701,16 @@ execute_merge_plan() {
 
     local preview_only=false
     local ask_each=false
+    local prev_verbose="$VERBOSE"
     if [[ "$INTERACTIVE" == true ]]; then
         if [[ "$VERBOSE" == true ]]; then
             ask_each=true
         else
             if ! prompt_confirmation "Deletion of $total_deletions redundant duplicate(s)"; then
                 return 0
+            fi
+            if [[ "$CONFIRM_ACTION" == "verify" ]]; then
+                ask_each=true
             fi
         fi
     elif [[ "$MODE" == "preview" ]]; then
@@ -1693,6 +1720,21 @@ execute_merge_plan() {
     if [[ "$preview_only" != true && "$EXEC_TARGET" == "file" && -z "$OUTPUT_FILE" ]]; then
         log_error "Input '--file' mode is read-only. Re-run with '--output <file>' to save cleaned data."
         return 1
+    fi
+
+    if [[ "$ask_each" == true && "$VERBOSE" != true ]]; then
+        VERBOSE=true
+        log_info "Switched to one-by-one verify mode for this operation."
+        local conflict_entries conflict_total c_idx=0 c_json
+        conflict_entries=$(echo "$merge_result" | jq -c '.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")')
+        conflict_total=$(echo "$merge_result" | jq '[.[] | select(.status == "CONFLICT_MULTIPLE_PASSKEYS")] | length')
+        if [[ "$conflict_total" -gt 0 ]]; then
+            while IFS= read -r -u 3 c_json; do
+                [[ -z "$c_json" ]] && continue
+                c_idx=$((c_idx + 1))
+                print_verbose_merge_cluster_card "$c_idx" "$conflict_total" "$c_json"
+            done 3<<< "$conflict_entries"
+        fi
     fi
 
     if [[ "$preview_only" == true && "$VERBOSE" != true ]]; then
@@ -1753,6 +1795,8 @@ execute_merge_plan() {
         log_warn "[DRY-RUN] No items deleted. Run with -i or --apply to execute."
         return 0
     fi
+
+    VERBOSE="$prev_verbose"
 
     local skip_note=""
     [[ $skipped_clusters -gt 0 ]] && skip_note=" ($skipped_clusters cluster(s) skipped)"

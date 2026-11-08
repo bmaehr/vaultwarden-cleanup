@@ -273,6 +273,27 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# 11.8: Switching to one-by-one verify mode ('v') right at the Action required confirmation prompt
+cp "$SCRIPT_DIR/fixture_generic_names.json" "$SCRIPT_DIR/mock_vault/items.json"
+# Inputs: '2' (fix-names, standard mode) -> 'v' (switch to verify one-by-one) -> 'y' (apply [1/2]) -> 'n' (skip [2/2]) -> 'q' (quit)
+out_switch_verify=$(printf "2\nv\ny\nn\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_vault" 2>&1)
+assert_contains "$out_switch_verify" "Verify one-by-one" "11.8a: Batch confirmation prompt offers switching to verify one-by-one mode"
+assert_contains "$out_switch_verify" "Switched to one-by-one verify mode" "11.8b: Choosing 'v' at confirmation activates one-by-one diff & prompts"
+assert_contains "$out_switch_verify" "1 name(s) updated" "11.8c: Applies approved item after switching from batch prompt to verify mode"
+assert_contains "$out_switch_verify" "currently: OFF" "11.8d: Restores wizard global verbose setting after single-operation verify switch"
+
+cp "$SCRIPT_DIR/fixture_duplicates.json" "$MOCK_LIVE_ITEMS"
+# Inputs: '1' (Safe Merge) -> 'v' (switch to verify one-by-one) -> 'y' (cluster 1) -> 'q' (cancel remaining)
+out_dup_verify=$(printf "1\nv\ny\nq\n" | \
+    PATH="/usr/bin:/bin" BW_SESSION="mock-session-token-123" MOCK_VAULT_STORE="$MOCK_LIVE_ITEMS" MOCK_BW_STATE_FILE="" "$BIN" -i duplicates 2>&1)
+assert_contains "$out_dup_verify" "1 duplicate(s) deleted" "11.8e: Duplicate cleanup supports switching to verify one-by-one at confirmation"
+
+cp "$SCRIPT_DIR/fixture_keepass_uris.json" "$SCRIPT_DIR/mock_vault/items.json"
+# Inputs: '1' (fix-uris, standard mode) -> 'v' (switch to verify one-by-one) -> 'y' (apply [1/1]) -> 'q' (quit)
+out_uri_verify=$(printf "1\nv\ny\nq\n" | "$BIN" -i --mock-bw "$SCRIPT_DIR/mock_vault" 2>&1)
+assert_contains "$out_uri_verify" "UPDATE ITEM: Migrate KeePass Web Match URIs" "11.8f: URI cleanup supports switching to verify one-by-one at confirmation"
+assert_contains "$out_uri_verify" "1 item(s) updated" "11.8g: URI cleanup persists item verified after switching via 'v'"
+
 if [[ "$CLEANUP_LOCAL_BIN" == true ]]; then
     rm -rf "$PARENT_DIR/.bin"
 fi

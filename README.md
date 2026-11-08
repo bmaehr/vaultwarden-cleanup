@@ -58,8 +58,8 @@ export BW_SESSION="your_session_key"
      - `[v]` Toggle verbose mode
      - `[b]` Back to main menu
 3. **Explicit Confirmation Prompts:**
-   - **Standard Mode:** Prompts once before applying the batch (`[y/N]`).
-   - **Verbose Mode (`-v` / `--verbose` or `[v]` in menus):** Displays an individual before/after diff card for every modified item or duplicate cluster (with passwords, TOTP secrets, and hidden custom fields masked as `********`), followed by a per-item decision prompt:
+   - **Standard Mode:** Shows the planned operation summary table and prompts before applying (`[y] Yes (apply all)  [v] Verify one-by-one  [N] No, Cancel`). Selecting `v` switches to step-by-step verify mode for that operation.
+   - **Verbose / Verify Mode (`-v` / `--verbose`, `[v]` in menus, or `v` at confirmation):** Displays an individual before/after diff card for every modified item or duplicate cluster (with passwords, TOTP secrets, and hidden custom fields masked as `********`), followed by a per-item decision prompt:
      - `[y]` Apply this item/cluster
      - `[n]` Skip this item/cluster (Default)
      - `[a]` Apply this and all remaining items/clusters without further prompts
